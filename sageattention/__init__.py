@@ -20,9 +20,14 @@ except (ImportError, OSError) as e:
             f"sageattention: CUDA-backed core kernels unavailable ({e}). "
             "Only the pure-Triton `sageattention.nvfp4` submodule will be importable.",
             RuntimeWarning,
+            stacklevel=2,
         )
 
 try:
     from . import nvfp4
 except (ImportError, OSError) as e:
-    warnings.warn(f"sageattention: failed to import the nvfp4 submodule ({e}).", RuntimeWarning)
+    warnings.warn(
+        f"sageattention: failed to import the nvfp4 submodule ({e}).",
+        RuntimeWarning,
+        stacklevel=2,
+    )
