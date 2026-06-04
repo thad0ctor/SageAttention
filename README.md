@@ -150,6 +150,35 @@ python cogvideox_infer.py --model cogvideox-2b --compile --attention_type sage
 ### Kernel Benchmarking
 We provide a benchmarking script to compare the speed of different kernels including SageAttention, FlashAttention2 and FlashAttention3. Please refer to the `benchmark/` directory for more details.
  
+## NVFP4 attention (training, sm_120)
+
+This fork adds `sageattention.nvfp4`, a **pure-Triton native-NVFP4 flash
+attention** (e2m1-packed operands + e4m3 group-16 block scales) for Blackwell
+**sm_120** GPUs. Unlike the inference-only Sage-3 kernel, it provides a fully
+**differentiable native-NVFP4 backward** (all four grad GEMMs run as FP4
+`tl.dot_scaled` ops), so it is usable inside a training loop. Supports causal
+masking and GQA; head dim `D` must be in `{128, 256}`.
+
+The submodule is Triton-only and has **no CUDA build dependency** — it installs
+and imports even when SageAttention's compiled extension is skipped:
+
+```bash
+SAGEATTN_SKIP_CUDA_BUILD=1 pip install -e .
+```
+
+```python
+import math
+from sageattention.nvfp4 import nvfp4_flash_attn_func
+
+# q: [Z, H, Sq, D], k/v: [Z, Hk, Skv, D]
+out = nvfp4_flash_attn_func(
+    q, k, v,
+    scaling=1.0 / math.sqrt(q.shape[-1]),
+    causal=True,
+    num_key_value_groups=q.shape[1] // k.shape[1],
+)
+```
+
 ## Performance
 ### Speed of Kernels
 

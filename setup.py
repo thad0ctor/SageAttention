@@ -278,6 +278,9 @@ setup(
     long_description=open('README.md', encoding='utf-8').read(),
     long_description_content_type='text/markdown',
     url='https://github.com/thu-ml/SageAttention',
+    # find_packages() also picks up the pure-Triton `sageattention.nvfp4`
+    # submodule, which has no CUDA build dep (installs fine with
+    # SAGEATTN_SKIP_CUDA_BUILD=1).
     packages=find_packages(),
     python_requires='>=3.9',
     ext_modules=ext_modules,
