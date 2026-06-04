@@ -86,9 +86,14 @@ def test_backward_sanity():
     kr = k.clone().requires_grad_(True)
     vr = v.clone().requires_grad_(True)
 
+    # Deterministic (round-to-nearest) backward is the meaningful parity check.
+    # With stochastic_rounding=True the per-element grads are unbiased but noisy,
+    # so a single SR sample has low cos-sim by design (it averages to the
+    # reference over steps — the convergence knob, not a per-step parity target).
     try:
         out = nvfp4_flash_attn_func(
-            qf, kf, vf, scaling, causal=True, num_key_value_groups=1
+            qf, kf, vf, scaling, causal=True, num_key_value_groups=1,
+            stochastic_rounding=False,
         )
     except Exception as exc:  # noqa: BLE001
         _skip_if_unsupported(exc)
@@ -106,4 +111,22 @@ def test_backward_sanity():
     ):
         assert g_fp4 is not None
         assert torch.isfinite(g_fp4).all()
-        assert _cos(g_fp4, g_ref) > 0.9
+        assert _cos(g_fp4, g_ref) > 0.95
+
+    # Stochastic rounding is unbiased: averaging samples converges to the ref.
+    grad_acc = [torch.zeros_like(qr.grad), torch.zeros_like(kr.grad), torch.zeros_like(vr.grad)]
+    n_samples = 16
+    for _ in range(n_samples):
+        qs = q.clone().requires_grad_(True)
+        ks = k.clone().requires_grad_(True)
+        vs = v.clone().requires_grad_(True)
+        o = nvfp4_flash_attn_func(
+            qs, ks, vs, scaling, causal=True, num_key_value_groups=1,
+            stochastic_rounding=True,
+        )
+        o.backward(grad)
+        for acc, g in zip(grad_acc, (qs.grad, ks.grad, vs.grad)):
+            acc += g.float()
+            assert torch.isfinite(g).all()
+    for acc, g_ref in zip(grad_acc, (qr.grad, kr.grad, vr.grad)):
+        assert _cos(acc / n_samples, g_ref) > 0.95
