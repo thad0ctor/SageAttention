@@ -701,18 +701,31 @@ def _flash_bwd_packprep_kernel(
     Sq,
     Sq_pad,
     D: tl.constexpr,
+    H: tl.constexpr,
     sq_n,
     sdo_n,
     so_n,
+    sdo_z,
+    sdo_h,
+    sdo_m,
+    sdo_d,
+    so_z,
+    so_h,
+    so_m,
+    so_d,
     SR_DO: tl.constexpr,
     SR_DOT: tl.constexpr,
     WRITE_DELTA: tl.constexpr,
     STORE_Q: tl.constexpr,
     STORE_QT: tl.constexpr,
+    DO_ZSHD: tl.constexpr,
+    O_ZSHD: tl.constexpr,
     BLOCK_M: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_zh = tl.program_id(1)
+    z = pid_zh // H
+    h = pid_zh % H
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, D)
     mmask = offs_m < Sq
@@ -762,17 +775,45 @@ def _flash_bwd_packprep_kernel(
             qtsc.to(tl.uint8, bitcast=True),
         )
 
-    do = tl.load(
-        do_ptr + pid_zh * (Sq * sdo_n) + offs_m[:, None] * sdo_n + offs_d[None, :],
-        mask=mmask[:, None],
-        other=0.0,
-    ).to(tl.float32)
-    if WRITE_DELTA:
-        o = tl.load(
-            o_ptr + pid_zh * (Sq * so_n) + offs_m[:, None] * so_n + offs_d[None, :],
+    if DO_ZSHD:
+        do = tl.load(
+            do_ptr
+            + z * sdo_z
+            + h * sdo_h
+            + offs_m[:, None] * sdo_m
+            + offs_d[None, :] * sdo_d,
             mask=mmask[:, None],
             other=0.0,
         ).to(tl.float32)
+    else:
+        do = tl.load(
+            do_ptr
+            + pid_zh * (Sq * sdo_n)
+            + offs_m[:, None] * sdo_n
+            + offs_d[None, :],
+            mask=mmask[:, None],
+            other=0.0,
+        ).to(tl.float32)
+    if WRITE_DELTA:
+        if O_ZSHD:
+            o = tl.load(
+                o_ptr
+                + z * so_z
+                + h * so_h
+                + offs_m[:, None] * so_m
+                + offs_d[None, :] * so_d,
+                mask=mmask[:, None],
+                other=0.0,
+            ).to(tl.float32)
+        else:
+            o = tl.load(
+                o_ptr
+                + pid_zh * (Sq * so_n)
+                + offs_m[:, None] * so_n
+                + offs_d[None, :],
+                mask=mmask[:, None],
+                other=0.0,
+            ).to(tl.float32)
         delta = tl.sum(do * o, axis=1)
         tl.store(delta_ptr + pid_zh * Sq + offs_m, delta, mask=mmask)
 
@@ -1488,6 +1529,7 @@ def nvfp4_flash_attention(
     num_stages: int = 3,
     return_lse: bool = False,
     return_packs: bool = False,
+    out_layout: str = "zhsd",
 ):
     """Fused native-NVFP4 flash attention, forward only.
 
@@ -1503,9 +1545,12 @@ def nvfp4_flash_attention(
         return_lse: also return the per-row logsumexp ``[Z*H, Sq]`` (fp32) so the
             backward can skip recomputing it (the FA2 backward prep's QK^T pass).
         return_packs: also return backward-reusable Q/K/V NVFP4 packs for autograd.
+        out_layout:
+          * ``"zhsd"`` (default): returns ``[Z, H, Sq, D]``.
+          * ``"zshd"``: returns ``[Z, Sq, H, D]`` written directly by the kernel.
 
     Returns:
-        ``[Z, H, Sq, D]`` in ``query.dtype`` (and the LSE tensor if ``return_lse``).
+        Attention output in ``query.dtype`` (and the LSE tensor if ``return_lse``).
     """
     z, h, s_q, d = query.shape
     _, hk, s_kv, _ = key.shape
@@ -1514,6 +1559,9 @@ def nvfp4_flash_attention(
     block_m, block_n, num_warps, num_stages = _resolve_fwd_tiles(
         d, block_m, block_n, num_warps, num_stages
     )
+    if out_layout not in ("zhsd", "zshd"):
+        raise ValueError("out_layout must be 'zhsd' or 'zshd'")
+    out_zshd = out_layout == "zshd"
     out_dtype = query.dtype
 
     q2 = query.reshape(z * h, s_q, d)
@@ -1546,7 +1594,10 @@ def nvfp4_flash_attention(
     if key_pad_bias is not None:
         bias = key_pad_bias.to(torch.float32).contiguous()
 
-    out = torch.empty(z * h, s_q, d, device=query.device, dtype=out_dtype)
+    if out_zshd:
+        out = torch.empty(z, s_q, h, d, device=query.device, dtype=out_dtype)
+    else:
+        out = torch.empty(z * h, s_q, d, device=query.device, dtype=out_dtype)
     lse = (
         torch.empty(z * h, s_q, device=query.device, dtype=torch.float32)
         if return_lse
@@ -1587,12 +1638,12 @@ def nvfp4_flash_attention(
             sv_sn=vsc_v.stride(1),
             sb_z=bias.stride(0) if bias is not None else 0,
             so_n=out.stride(1),
-            so_z=0,
-            so_h=0,
+            so_z=out.stride(0) if out_zshd else 0,
+            so_h=out.stride(2) if out_zshd else 0,
             HAS_BIAS=bias is not None,
             CAUSAL=causal,
             STORE_LSE=return_lse,
-            OUT_ZSHD=False,
+            OUT_ZSHD=out_zshd,
             BLOCK_M=block_m,
             BLOCK_N=block_n,
             DP2=d // 2,
@@ -1605,12 +1656,12 @@ def nvfp4_flash_attention(
 
     _run()
     if return_lse and return_packs:
-        return out.reshape(z, h, s_q, d), lse, packs
+        return (out if out_zshd else out.reshape(z, h, s_q, d)), lse, packs
     if return_lse:
-        return out.reshape(z, h, s_q, d), lse
+        return (out if out_zshd else out.reshape(z, h, s_q, d)), lse
     if return_packs:
-        return out.reshape(z, h, s_q, d), packs
-    return out.reshape(z, h, s_q, d)
+        return (out if out_zshd else out.reshape(z, h, s_q, d)), packs
+    return out if out_zshd else out.reshape(z, h, s_q, d)
 
 
 # ---------------------------------------------------------------------------
@@ -1651,6 +1702,8 @@ def _run_bwd(
     vsc_saved=None,
     ktnv_saved=None,
     ktsc_saved=None,
+    do_zshd=False,
+    o_zshd=False,
 ):
     """Native-NVFP4 backward. q/do/o: [Z*H,Sq,D]; k/v: [Z*Hk,Skv,D] (hp).
     Returns dq [Z*H,Sq,D], dk/dv [Z*H,Skv,D] (per query head; GQA-reduced by the caller).
@@ -1658,6 +1711,8 @@ def _run_bwd(
     If ``lse`` (the forward's per-row logsumexp, [Z*H,Sq]) is supplied, the prep
     kernel reuses it instead of recomputing it with a full FP4 QK^T pass."""
     have_lse = lse is not None
+    if (do_zshd or o_zshd) and not have_lse:
+        raise ValueError("zshd backward inputs require forward LSE reuse")
     reuse_q_pack = qnv_saved is not None and qsc_saved is not None
     reuse_qt_pack = qtnv_saved is not None and qtsc_saved is not None
     reuse_k_pack = knv_saved is not None and ksc_saved is not None
@@ -1703,6 +1758,18 @@ def _run_bwd(
     bdummy = bias if bias is not None else q
     sb_z = bias.stride(0) if bias is not None else 0
     has_bias = bias is not None
+    if do_zshd:
+        sdo_z, sdo_m, sdo_h, sdo_d = do.stride()
+        sdo_n = 0
+    else:
+        sdo_z = sdo_h = sdo_m = sdo_d = 0
+        sdo_n = do.stride(1)
+    if o_zshd:
+        so_z, so_m, so_h, so_d = o.stride()
+        so_n = 0
+    else:
+        so_z = so_h = so_m = so_d = 0
+        so_n = o.stride(1)
 
     if not have_lse:
         _flash_bwd_prep_kernel[(triton.cdiv(s_q, block_m), z * h)](
@@ -1722,8 +1789,8 @@ def _run_bwd(
             HK=hk,
             sq_n=q.stride(1),
             sk_n=k.stride(1),
-            sdo_n=do.stride(1),
-            so_n=o.stride(1),
+            sdo_n=sdo_n,
+            so_n=so_n,
             sb_z=sb_z,
             HAS_BIAS=has_bias,
             CAUSAL=causal,
@@ -1786,14 +1853,25 @@ def _run_bwd(
         s_q,
         s_q_pad,
         D=d,
+        H=h,
         sq_n=q.stride(1),
-        sdo_n=do.stride(1),
-        so_n=o.stride(1),
+        sdo_n=sdo_n,
+        so_n=so_n,
+        sdo_z=sdo_z,
+        sdo_h=sdo_h,
+        sdo_m=sdo_m,
+        sdo_d=sdo_d,
+        so_z=so_z,
+        so_h=so_h,
+        so_m=so_m,
+        so_d=so_d,
         SR_DO=sr,
         SR_DOT=sr_dot_dv,
         WRITE_DELTA=have_lse,
         STORE_Q=not reuse_q_pack,
         STORE_QT=not reuse_qt_pack,
+        DO_ZSHD=do_zshd,
+        O_ZSHD=o_zshd,
         BLOCK_M=pp_block_m,
         num_warps=8,
         num_stages=2,

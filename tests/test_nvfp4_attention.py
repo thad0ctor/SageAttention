@@ -69,6 +69,37 @@ def test_forward_parity(causal, hk):
     assert _cos(out, ref) > 0.95
 
 
+def test_forward_zshd_layout_matches_default():
+    torch.manual_seed(7)
+    z, h, hk, s, d = 1, 4, 2, 128, 128
+    scaling = 1.0 / math.sqrt(d)
+    groups = h // hk
+
+    q = torch.randn(z, h, s, d, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(z, hk, s, d, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(z, hk, s, d, device="cuda", dtype=torch.bfloat16)
+
+    try:
+        out = nvfp4_flash_attention(
+            q, k, v, scaling, causal=True, num_key_value_groups=groups
+        )
+        out_zshd = nvfp4_flash_attention(
+            q,
+            k,
+            v,
+            scaling,
+            causal=True,
+            num_key_value_groups=groups,
+            out_layout="zshd",
+        )
+    except Exception as exc:  # noqa: BLE001
+        _skip_if_unsupported(exc)
+
+    assert out_zshd.shape == (z, s, h, d)
+    assert out_zshd.is_contiguous()
+    assert torch.equal(out_zshd, out.transpose(1, 2).contiguous())
+
+
 def test_backward_sanity():
     torch.manual_seed(0)
     z, h, hk, s, d = 1, 4, 4, 128, 128
