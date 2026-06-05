@@ -210,7 +210,7 @@ def _quant_nvfp4(
     K = k_pad if k_pad is not None else K_read
     assert K % 16 == 0, "padded contraction dim must be a multiple of 16"
     q = x.new_empty(B, R, K // 2, dtype=torch.uint8)
-    s = x.new_zeros(B, R, K // 16, dtype=torch.uint8)
+    s = x.new_empty(B, R, K // 16, dtype=torch.uint8)
     BLOCK_R = 64
     BLOCK_K = min(triton.next_power_of_2(K), 256)
     grid = (B, triton.cdiv(R, BLOCK_R), triton.cdiv(K, BLOCK_K))
@@ -347,9 +347,9 @@ def _quant_nvfp4_dual(
     BLOCK_S = 64
     assert s_pad % BLOCK_S == 0 or s_pad <= BLOCK_S, "s_pad must tile by BLOCK_S"
     qa = x.new_empty(B, S, D // 2, dtype=torch.uint8)
-    sa = x.new_zeros(B, S, D // 16, dtype=torch.uint8)
+    sa = x.new_empty(B, S, D // 16, dtype=torch.uint8)
     qb = x.new_empty(B, D, s_pad // 2, dtype=torch.uint8)
-    sb = x.new_zeros(B, D, s_pad // 16, dtype=torch.uint8)
+    sb = x.new_empty(B, D, s_pad // 16, dtype=torch.uint8)
     grid = (B, triton.cdiv(s_pad, BLOCK_S))
     _quant_nvfp4_dual_kernel[grid](
         x,
@@ -1749,17 +1749,25 @@ def _run_bwd(
         qsc_p = qsc_saved
     else:
         qnv_p = q.new_empty(z * h, s_q, d // 2, dtype=torch.uint8)
-        qsc_p = q.new_zeros(z * h, s_q, d // 16, dtype=torch.uint8)
+        qsc_p = q.new_empty(z * h, s_q, d // 16, dtype=torch.uint8)
     donv_p = q.new_empty(z * h, s_q, d // 2, dtype=torch.uint8)
-    dosc_p = q.new_zeros(z * h, s_q, d // 16, dtype=torch.uint8)
+    dosc_p = q.new_empty(z * h, s_q, d // 16, dtype=torch.uint8)
     if reuse_qt_pack:
         qtnv_p = qtnv_saved.view(torch.uint8)
         qtsc_p = qtsc_saved
     else:
         qtnv_p = q.new_empty(z * h, d, s_q_pad // 2, dtype=torch.uint8)
-        qtsc_p = q.new_zeros(z * h, d, s_q_pad // 16, dtype=torch.uint8)
+        qtsc_p = (
+            q.new_empty(z * h, d, s_q_pad // 16, dtype=torch.uint8)
+            if s_q_pad == s_q
+            else q.new_zeros(z * h, d, s_q_pad // 16, dtype=torch.uint8)
+        )
     dotnv_p = q.new_empty(z * h, d, s_q_pad // 2, dtype=torch.uint8)
-    dotsc_p = q.new_zeros(z * h, d, s_q_pad // 16, dtype=torch.uint8)
+    dotsc_p = (
+        q.new_empty(z * h, d, s_q_pad // 16, dtype=torch.uint8)
+        if s_q_pad == s_q
+        else q.new_zeros(z * h, d, s_q_pad // 16, dtype=torch.uint8)
+    )
     _flash_bwd_packprep_kernel[(triton.cdiv(s_q, pp_block_m), z * h)](
         q,
         do,
@@ -1805,19 +1813,19 @@ def _run_bwd(
         ksc_p = ksc_saved
     else:
         knv_p = k.new_empty(z * hk, s_kv, d // 2, dtype=torch.uint8)
-        ksc_p = k.new_zeros(z * hk, s_kv, d // 16, dtype=torch.uint8)
+        ksc_p = k.new_empty(z * hk, s_kv, d // 16, dtype=torch.uint8)
     if reuse_v_pack:
         vnv_p = vnv_saved.view(torch.uint8)
         vsc_p = vsc_saved
     else:
         vnv_p = k.new_empty(z * hk, s_kv, d // 2, dtype=torch.uint8)
-        vsc_p = k.new_zeros(z * hk, s_kv, d // 16, dtype=torch.uint8)
+        vsc_p = k.new_empty(z * hk, s_kv, d // 16, dtype=torch.uint8)
     if reuse_kt_pack:
         ktnv_p = ktnv_saved.view(torch.uint8)
         ktsc_p = ktsc_saved
     else:
         ktnv_p = k.new_empty(z * hk, d, s_kv_pad // 2, dtype=torch.uint8)
-        ktsc_p = k.new_zeros(z * hk, d, s_kv_pad // 16, dtype=torch.uint8)
+        ktsc_p = k.new_empty(z * hk, d, s_kv_pad // 16, dtype=torch.uint8)
     if not (reuse_k_pack and reuse_v_pack and reuse_kt_pack):
         _flash_bwd_kprep_kernel[(triton.cdiv(s_kv, kprep_block_n), z * hk)](
             k,
