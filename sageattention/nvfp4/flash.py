@@ -1687,10 +1687,11 @@ def _run_bwd(
     # (pT, dSt), so a NARROW key tile (BLOCK_N=32) + 8 warps + deep pipelining
     # (3 stages) is dramatically faster than the old wide-tile config: the small
     # footprint lets the scheduler overlap the SR-pack ALU with the FP4 GEMMs and
-    # the K/V loads instead of spilling. ~8x faster than BLOCK_N=128 / 16 warps.
+    # the K/V loads instead of spilling. Long D=256 contexts prefer 2 stages; short
+    # contexts still need 3 for enough overlap.
     dkdv_block_n = 32 if d <= 256 else 32
     dkdv_warps = 8
-    dkdv_stages = 3
+    dkdv_stages = 2 if d == 256 and s_q >= 4096 else 3
     # dq loops over key blocks (already cheap). q/do are prepacked in HBM, which
     # trims the loop footprint; two stages win at short seq, while long seq can use
     # the extra overlap from a third stage.
