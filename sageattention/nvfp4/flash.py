@@ -342,10 +342,9 @@ def _quant_nvfp4_dual(
     assert D % 16 == 0 and D in (128, 256)
     assert s_pad % 16 == 0 and s_pad >= S
     x = x.contiguous()
-    # BLOCK_S aligned to 16 so along-S groups never straddle a tile; the grid spans
-    # the PADDED S so the last (padding) tile zero-fills layout B's tail groups.
-    BLOCK_S = 64
-    assert s_pad % BLOCK_S == 0 or s_pad <= BLOCK_S, "s_pad must tile by BLOCK_S"
+    # BLOCK_S aligned to 16 so along-S groups never straddle a tile. D=256 was
+    # measured faster with the smaller tile; keep D=128 on the previous tile.
+    BLOCK_S = 32 if D == 256 else 64
     qa = x.new_empty(B, S, D // 2, dtype=torch.uint8)
     sa = x.new_empty(B, S, D // 16, dtype=torch.uint8)
     qb = x.new_empty(B, D, s_pad // 2, dtype=torch.uint8)
