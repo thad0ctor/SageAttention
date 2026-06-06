@@ -161,3 +161,46 @@ def test_backward_sanity():
             assert torch.isfinite(g).all()
     for acc, g_ref in zip(grad_acc, (qr.grad, kr.grad, vr.grad)):
         assert _cos(acc / n_samples, g_ref) > 0.95
+
+
+@pytest.mark.parametrize("d", [128, 256])
+def test_no_gqa_auto_bf16_scratch_matches_fp32_scratch(d):
+    torch.manual_seed(23 + d)
+    z, h, s = 1, 2, 64
+    scaling = 1.0 / math.sqrt(d)
+
+    q = torch.randn(z, h, s, d, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(z, h, s, d, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(z, h, s, d, device="cuda", dtype=torch.bfloat16)
+    grad = torch.randn_like(q)
+
+    def run(*, explicit_fp32_scratch):
+        qx = q.clone().requires_grad_(True)
+        kx = k.clone().requires_grad_(True)
+        vx = v.clone().requires_grad_(True)
+        kwargs = (
+            {"dkdv_scratch_bf16": False}
+            if explicit_fp32_scratch
+            else {}
+        )
+        out = nvfp4_flash_attn_func(
+            qx,
+            kx,
+            vx,
+            scaling,
+            causal=True,
+            num_key_value_groups=1,
+            stochastic_rounding=False,
+            **kwargs,
+        )
+        out.backward(grad)
+        return out.detach(), qx.grad, kx.grad, vx.grad
+
+    try:
+        auto = run(explicit_fp32_scratch=False)
+        fp32 = run(explicit_fp32_scratch=True)
+    except Exception as exc:  # noqa: BLE001
+        _skip_if_unsupported(exc)
+
+    for auto_tensor, fp32_tensor in zip(auto, fp32):
+        assert torch.equal(auto_tensor, fp32_tensor)

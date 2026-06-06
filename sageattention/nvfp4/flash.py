@@ -2140,6 +2140,13 @@ class _NVFP4FlashAttn(torch.autograd.Function):
             # bias-dummy pointer — o satisfies that.
             q = k = v = o
         do = grad_out.reshape(z * h, s_q, d).contiguous()
+        dkdv_scratch_bf16 = ctx.dkdv_scratch_bf16
+        if dkdv_scratch_bf16 is None:
+            # With no GQA reduction, each scratch element is only downcast once before
+            # return, so bf16 scratch is bit-identical to fp32 scratch followed by the
+            # final bf16 cast. GQA still needs fp32 scratch to preserve reduction math.
+            dkdv_scratch_bf16 = h == hk and grad_out.dtype == torch.bfloat16
+
         dq, dk, dv = _run_bwd(
             q,
             k,
@@ -2164,7 +2171,7 @@ class _NVFP4FlashAttn(torch.autograd.Function):
             sr_p_dv=ctx.backward_p_dv_sr,
             sr_dot_dv=ctx.backward_dot_dv_sr,
             sr_ds_dq=ctx.backward_ds_dq_sr,
-            dkdv_scratch_bf16=ctx.dkdv_scratch_bf16,
+            dkdv_scratch_bf16=dkdv_scratch_bf16,
             qnv_saved=qnv if qnv.numel() else None,
             qsc_saved=qsc if qsc.numel() else None,
             qtnv_saved=qtnv if qtnv.numel() else None,
@@ -2217,7 +2224,7 @@ def nvfp4_flash_attn_func(
     backward_p_dv_stochastic_rounding: bool | None = None,
     backward_dot_dv_stochastic_rounding: bool | None = None,
     backward_ds_dq_stochastic_rounding: bool | None = None,
-    dkdv_scratch_bf16: bool = False,
+    dkdv_scratch_bf16: bool | None = None,
     block_m: int = 64,
     block_n: int = 128,
     num_warps: int = 8,
@@ -2230,6 +2237,8 @@ def nvfp4_flash_attn_func(
     stochastic rounding when ``stochastic_rounding`` (the convergence-critical
     knob — see ``utils/nvfp4_training``). q:[Z,H,Sq,D], k/v:[Z,Hk,Skv,D]; D in
     {128,256}; supports causal and GQA. Returns [Z,H,Sq,D] in query.dtype.
+    ``dkdv_scratch_bf16=None`` auto-enables bf16 dQ/dK/dV scratch only for no-GQA
+    bf16 backward, where it is bit-identical to fp32 scratch plus the final cast.
     """
     z, h, s_q, d = query.shape
     _, hk, s_kv, _ = key.shape
