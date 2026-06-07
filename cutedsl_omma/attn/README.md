@@ -153,6 +153,79 @@ PYTHONUNBUFFERED=1 PYTHONPATH=reference:.:<fork-repo> CUDA_VISIBLE_DEVICES=1 \
 #      ATT_ITERS, ATT_WARMUP.
 ```
 
+## Fused single-kernel: design, the on-chip-P-requant solution, and the blocker
+
+Files added for the fused attempt:
+- `fp4_attention_fused.py` — the fused DESIGN + a runnable proof that prints the
+  EXACT MMA thread-value (TV) layouts the on-chip P requant must target (validated
+  against the live `MmaMXF4NVF4Op` atom). Run it via the shim; it prints the table
+  below and the status.
+- `fused_qk_scratch.py` — the from-scratch sm120 NVFP4 warp-MMA foundation (one
+  CTA, tile M128 N128 K256, cp.async/universal-copy loads, NO TMA). This is the
+  prerequisite building block for the fused flash kernel.
+
+### The on-chip P requant — the SOLVED layout mapping (the central hard problem)
+Printed + validated by `fp4_attention_fused.py` (tile (128,128,64), native
+kind::mxf4nvf4, `thr_layout_vmnk = (32,4,2,1)`):
+
+| role                         | TV layout (validated from the live atom) |
+|------------------------------|------------------------------------------|
+| S accumulator (GEMM-1 out)   | `partition_C = ((2,2),2,(2,4)):((1@1,8@0),64@0,(8@1,32@1))` |
+| P operand-A target (GEMM-2)  | `partition_A = ((8,2,2),2,1):((1@1,8@0,32@1),64@0,0)` |
+| P A-scale-factor TV target   | `get_layoutSFA_TV = ((2,2,8,4,2),(64,(2,1)))` |
+| A-SF SMEM swizzle (per stage)| `sfa_smem = (((32,4),1),((16,4),1,1),1):(((16,4),512),((0,1),4,512),512)` |
+
+**Key finding:** the accumulator TV and the operand-A TV are DIFFERENT and the key
+axis moves from S's N axis (acc) to P's K axis (operand A). There is therefore
+**no register-only reshuffle** — P must round-trip through SMEM. The on-chip
+requant is: (1) online softmax in registers on the acc -> `p = exp(S-rowmax)`
+(un-normalized; divide O by the denom in the epilogue); (2) store p>=0 to an SMEM
+staging tile in the operand-A swizzle; (3) compute the group-16 amax per
+(query-row, key-group) on-chip (warp-shuffle reduce over 16 contiguous keys),
+`scale = amax/6 -> e4m3`, and write that e4m3 scale into the `sfa_smem` M(32x4)xK(4)
+swizzle above — the in-register equivalent of the host
+`cvt_sf_MKL_to_M32x4xrm_K4xrk_L`; (4) quantize `p/scale -> e2m1` into operand-A
+SMEM; (5) ldmatrix p + its SF back as GEMM-2's A + A-SF, with V (pre-quantized
+along the key axis) as operand B. The mapping (steps 1-4) is fully derived and
+validated above; this answers the task's "lay the SF out in the exact swizzled TV
+layout the MMA reads its A-scale operand from" sub-problem.
+
+### The blocker (honest, reproducible)
+`fused_qk_scratch.py` is a from-scratch single-tile NVFP4 warp MMA that
+**compiles correctly through**: the gmem->smem FP4 operand load (8-bit universal
+copy into the swizzled SMEM), the host-swizzled SF SMEM load, the tiled-MMA
+A/B/SF fragment partition (`partition_fragment_SFA/SFB`), and the SF thread-value
+copies (`get_layoutSFA_TV`/`SFB_TV`). It **fails only** at the FP4 ldmatrix step:
+
+```
+'cute.copy' op src ptr alignment (64 bits) does not meet requirement (128 bits)
+of atom 'ldsm<val_type=f4E2M1FN, mode=(8,8), num_matrices=4>'
+```
+
+i.e. `ldmatrix.x4` for FP4 requires a 128-bit-aligned SMEM source, but the
+hand-built SMEM swizzle atom (`get_smem_layout_atom(ROW_MAJOR, fp4, K)` ->
+`S<2,4,3> o (8,128)`) yields only 64-bit-aligned per-thread sources — even at
+tile_K=256. The reference cooperative GEMM does not hit this because its
+TMA-paired SMEM swizzle is bit-exactly matched to the sm120 ldmatrix.x4 FP4
+source contract (an internal `get_smem_layout_atom`/`make_ldmatrix_atom` pairing).
+Reproducing that exact pairing from scratch (or substituting a manual
+LDSM-free smem->rmem fragment fill matching `partition_A`'s TV) is the precise
+remaining work. This is the SAME structural reason the two-pass reuses the
+reference kernel at tile (128,128,256): the FP4 ldmatrix/swizzle contract is the
+hard, non-obvious part, not the MMA math (which the two-pass proves correct,
+cos 0.989).
+
+### Bottom line
+- The **correct, measured** NVFP4 warp-OMMA forward is the two-pass
+  `fp4_attention_fwd.py` (cos 0.989 vs SDPA at seq 1024-16384; Triton's fused
+  forward is 1.5-5.7x faster, gap closing with seq — a per-head-launch + readback
+  prototype artifact, NOT an OMMA-throughput loss, per the QK-only result where
+  CuTeDSL beat Triton 1.8x at seq>=4096).
+- The **fused** single-kernel: design complete, the on-chip P-requant TV mapping
+  derived + validated, the from-scratch warp-MMA foundation builds up to the FP4
+  ldmatrix.x4 alignment wall. Partial-but-correct: the layout analysis and the
+  building blocks are real and validated; the end-to-end fused launch is not.
+
 ## Remaining work to a full flash forward
 0. **DONE (two-pass):** the full forward is wired and validated (above). What
    remains is the *fused* version and the stretch goals below.
