@@ -718,17 +718,21 @@ def _next_mult(n: int, m: int) -> int:
     return ((n + m - 1) // m) * m
 
 
+# Triton < 3.7 mis-lowers an FP4 tl.dot_scaled when a tile dim equals head_dim D:
+# the operand is logically square (tile == contraction K) and the block-scale axis
+# binding is ambiguous -> garbage (cos ~0.2-0.6 vs SDPA). Triton 3.7 fixed it
+# (verified: all D=128 tiles cos ~0.986, incl. the fast 128x128). Detect once.
+_FP4_SQUARE_OK = tuple(int(x) for x in triton.__version__.split(".")[:2]) >= (3, 7)
+
 # Forward flash-tile defaults per head_dim. (block_m, block_n, num_warps, num_stages).
-# CORRECTNESS (sm_120): a tile dim equal to head_dim D makes an FP4 tl.dot_scaled
-# operand logically square (tile == contraction K), and Triton's block-scale axis
-# lowering mis-binds the scale -> garbage (cos ~0.2-0.6 vs SDPA). At D=128 that bans
-# block_m==128 and block_n==128. The prior (128,128,8,2) D=128 "perf" tile was that
-# exact broken case (throughput-swept, never correctness-gated). Separately the
-# save-packs training path is wrong with block_m=32. So D=128 needs block_m=64 and
-# block_n in {64,256}; (64,64,8,3) is the fastest correct end-to-end (fwd+bwd+save-
-# packs, validated loss 0.43). D=256 (64,128,8,3) is safe (128!=256). A faster D=128
-# needs an upstream Triton fix for square FP4 dot_scaled operands.
-_FWD_TILE = {256: (64, 128, 8, 3), 128: (64, 64, 8, 3)}
+# D=256 (64,128,8,3) is always safe (128 != 256). D=128: on Triton 3.7+ use the fast
+# (128,128,8,2); on older Triton fall back to (64,64,8,3) — the fastest tile that's
+# correct end-to-end there (block_m=64; block_m==128/block_n==128 hit the square bug,
+# and block_m=32 separately breaks the save-packs path). Both validated (loss ~0.43).
+_FWD_TILE = {
+    256: (64, 128, 8, 3),
+    128: (128, 128, 8, 2) if _FP4_SQUARE_OK else (64, 64, 8, 3),
+}
 _FWD_TILE_DEFAULT = (64, 128, 8, 3)
 
 # Below this seqlen the forward pre-quant is launch/overhead bound, so folding the
@@ -1745,12 +1749,14 @@ def nvfp4_flash_attention(
     # D=128 block_m==D makes the FP4 dot_scaled operand square -> wrong (cos ~0.31).
     # Fall through to the validated (64,64); re-add a faster tile only behind a
     # correctness gate and with block_m != D, block_n != D.)
-    # A tile dim equal to head_dim D corrupts the FP4 dot_scaled scale binding
-    # (square operand). Fail loud instead of silently returning garbage.
-    assert block_m != d and block_n != d, (
+    # On Triton < 3.7 a tile dim == head_dim D corrupts the FP4 dot_scaled scale
+    # binding (square operand). Fail loud instead of silently returning garbage.
+    # Triton 3.7+ fixed this, so the fast block==D tiles are allowed there.
+    assert _FP4_SQUARE_OK or (block_m != d and block_n != d), (
         f"NVFP4 forward tile (block_m={block_m}, block_n={block_n}) has a dim equal "
-        f"to head_dim d={d}; this mis-binds the FP4 dot_scaled block-scale axis "
-        f"(square operand) and returns wrong results. Pick block_m/block_n != d."
+        f"to head_dim d={d} on Triton {triton.__version__}; this mis-binds the FP4 "
+        f"dot_scaled block-scale axis (square operand) and returns wrong results. "
+        f"Pick block_m/block_n != d, or upgrade to Triton >= 3.7."
     )
     if out_layout not in ("zhsd", "zshd"):
         raise ValueError("out_layout must be 'zhsd' or 'zshd'")
@@ -2331,9 +2337,9 @@ def _run_bwd(
     # the extra overlap from a third stage.
     dq_block_m = block_m
     dq_block_n = 64 if d >= 256 else min(block_n, 128)
-    if dq_block_n == d:
-        # tile == head_dim makes the backward dP FP4 dot_scaled operand square,
-        # which mis-binds the block-scale axis -> corrupt dQ. Step off D.
+    if (not _FP4_SQUARE_OK) and dq_block_n == d:
+        # Triton < 3.7: tile == head_dim makes the backward dP FP4 dot_scaled operand
+        # square, mis-binding the block-scale axis -> corrupt dQ. Step off D.
         dq_block_n = d // 2
     dq_warps = max(num_warps, 8)
     dq_stages = 3 if s_q >= 4096 else 2
