@@ -2337,9 +2337,11 @@ def _run_bwd(
     # the extra overlap from a third stage.
     dq_block_m = block_m
     dq_block_n = 64 if d >= 256 else min(block_n, 128)
-    if (not _FP4_SQUARE_OK) and dq_block_n == d:
-        # Triton < 3.7: tile == head_dim makes the backward dP FP4 dot_scaled operand
-        # square, mis-binding the block-scale axis -> corrupt dQ. Step off D.
+    if dq_block_n == d:
+        # tile == head_dim makes the backward dP FP4 dot_scaled operand square,
+        # mis-binding the block-scale axis -> corrupt dQ. UNLIKE the forward, this
+        # is NOT fixed by Triton 3.7 (verified end-to-end: dq_block_n=128 at d=128
+        # gives loss 1.14 vs 0.43 with dq_block_n=64), so clamp UNCONDITIONALLY.
         dq_block_n = d // 2
     dq_warps = max(num_warps, 8)
     dq_stages = 3 if s_q >= 4096 else 2
