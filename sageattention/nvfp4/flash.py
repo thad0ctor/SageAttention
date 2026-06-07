@@ -2043,6 +2043,138 @@ def _flash_decode_combine_kernel(
     )
 
 
+def nvfp4_quant_kv_decode(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    block_n: int = 128,
+) -> tuple:
+    """Pre-quantize a GQA KV cache to the NVFP4 layout the decode kernel consumes.
+
+    Decode is HBM-bound: the cost is reading K/V, not the (tiny) MMA. The full
+    ``nvfp4_flash_decode`` re-quantizes the whole cache on every step, which reads
+    the entire bf16 cache from HBM each call — exactly the traffic the fp4 cache
+    is meant to eliminate. Real serving keeps the cache *stored* in NVFP4 and pays
+    the per-token quant once at append time; this helper produces that stored form
+    so ``nvfp4_flash_decode_prequant`` can run the compute-only path (which beats
+    bf16 SDPA — see the design note above).
+
+    Args:
+        key/value: ``[Z, Hk, Skv, D]`` (pre-repeat_kv GQA) high precision.
+        block_n: key tile; the V^T key axis is padded to a multiple of this.
+
+    Returns:
+        ``(knv, ksc, vnv, vsc, s_kv, s_kv_pad)`` — packed K (along-D) and V (along-
+        key^T, padded), ready to feed ``nvfp4_flash_decode_prequant``.
+    """
+    z, hk, s_kv, d = key.shape
+    assert d % 16 == 0 and d in (128, 256)
+    s_kv_pad = _next_mult(s_kv, block_n)
+    k2 = key.reshape(z * hk, s_kv, d)
+    v2 = value.reshape(z * hk, s_kv, d)
+    knv, ksc = _quant_nvfp4(k2)
+    vnv, vsc = _quant_nvfp4(v2, transpose=True, k_pad=s_kv_pad)
+    return knv, ksc, vnv, vsc, s_kv, s_kv_pad
+
+
+def _decode_compute(
+    qnv, qsc, knv, ksc, vnv, vsc,
+    z, h, hk, d, s_kv, s_kv_pad,
+    out_dtype, device, scaling, g,
+    block_n, num_warps, num_stages, target_programs,
+) -> torch.Tensor:
+    """Pass-1 (partials) + pass-2 (combine) over PRE-PACKED NVFP4 Q/K/V.
+
+    Q packed [Z*Hk, G, D] (along-D); K packed [Z*Hk, Skv, D] (along-D); V packed
+    [Z*Hk, D, s_kv_pad] (along-key^T). Returns [Z, H, 1, D] in ``out_dtype``.
+    """
+    BLOCK_M = 16
+    # choose split count so Z*Hk*NSPLIT ~ target_programs; SPLIT_KV multiple of block_n.
+    n_kblocks = triton.cdiv(s_kv, block_n)
+    want = max(1, target_programs // (z * hk))
+    nsplit = max(1, min(n_kblocks, want))
+    split_blocks = triton.cdiv(n_kblocks, nsplit)
+    split_kv = split_blocks * block_n
+    nsplit = triton.cdiv(s_kv, split_kv)  # recompute actual splits covering s_kv
+
+    op = torch.empty(z * hk, nsplit, BLOCK_M, d, device=device, dtype=torch.float32)
+    mp = torch.empty(z * hk, nsplit, BLOCK_M, device=device, dtype=torch.float32)
+    lp = torch.empty(z * hk, nsplit, BLOCK_M, device=device, dtype=torch.float32)
+
+    qnv_v, knv_v, vnv_v = qnv.view(torch.uint8), knv.view(torch.uint8), vnv.view(torch.uint8)
+    qsc_v, ksc_v, vsc_v = qsc.view(torch.uint8), ksc.view(torch.uint8), vsc.view(torch.uint8)
+
+    _flash_decode_kernel[(z * hk, nsplit)](
+        qnv_v, qsc_v, knv_v, ksc_v, vnv_v, vsc_v,
+        op, mp, lp,
+        scaling, s_kv, g, split_kv,
+        D=d,
+        sq_qn=qnv_v.stride(1), sq_sn=qsc_v.stride(1),
+        sk_kn=knv_v.stride(1), sk_sn=ksc_v.stride(1),
+        sv_kn=vnv_v.stride(1), sv_sn=vsc_v.stride(1),
+        NSPLIT=nsplit, BLOCK_M=BLOCK_M, BLOCK_N=block_n,
+        DP2=d // 2, DP16=d // 16, NP2=block_n // 2, NP16=block_n // 16,
+        num_warps=num_warps, num_stages=num_stages,
+    )
+
+    out = torch.empty(z, h, d, device=device, dtype=out_dtype)
+    _flash_decode_combine_kernel[(z * hk,)](
+        op, mp, lp, out,
+        g, HK=hk, D=d, NSPLIT=nsplit, BLOCK_M=BLOCK_M,
+        so_z=out.stride(0), so_h=out.stride(1),
+        num_warps=4,
+    )
+    return out.reshape(z, h, 1, d)
+
+
+def nvfp4_flash_decode_prequant(
+    query: torch.Tensor,
+    kv_packed: tuple,
+    scaling: float,
+    num_key_value_groups: int = 1,
+    block_n: int = 128,
+    num_warps: int = 4,
+    num_stages: int = 3,
+    target_programs: int = 256,
+) -> torch.Tensor:
+    """NVFP4 decode against a PRE-QUANTIZED KV cache (the HBM-bound fast path).
+
+    ``kv_packed`` is the tuple returned by ``nvfp4_quant_kv_decode``. Only Q is
+    quantized here (negligible — one token); K/V are read straight from their fp4
+    cache, so total HBM traffic is ~4x below bf16 SDPA. This is the path that wins
+    for MHA (g=1) as well as GQA; the convenience ``nvfp4_flash_decode`` instead
+    re-quantizes K/V each call and is HBM-bound by that bf16 read.
+
+    Args:
+        query: ``[Z, H, 1, D]`` high precision (bf16/fp16/fp32). D in {128, 256}.
+        kv_packed: ``(knv, ksc, vnv, vsc, s_kv, s_kv_pad)`` from
+            ``nvfp4_quant_kv_decode``; ``Hk`` is inferred from its batch dim.
+        scaling: softmax scale.
+        num_key_value_groups: ``G = H // Hk``. Must be <= 16.
+
+    Returns:
+        Attention output ``[Z, H, 1, D]`` in ``query.dtype``.
+    """
+    z, h, s_q, d = query.shape
+    assert s_q == 1, "nvfp4_flash_decode is for seqlen_q == 1 (decode)"
+    assert d % 16 == 0 and d in (128, 256)
+    knv, ksc, vnv, vsc, s_kv, s_kv_pad = kv_packed
+    zhk = knv.shape[0]
+    assert zhk % z == 0, "packed KV batch must be a multiple of Z"
+    hk = zhk // z
+    g = num_key_value_groups
+    assert h % hk == 0 and h // hk == g, "G mismatch vs packed KV"
+    assert g <= 16, f"GQA group {g} must be <= 16"
+
+    q2 = query.reshape(z, hk, g, d).reshape(z * hk, g, d)
+    qnv, qsc = _quant_nvfp4(q2)
+    return _decode_compute(
+        qnv, qsc, knv, ksc, vnv, vsc,
+        z, h, hk, d, s_kv, s_kv_pad,
+        query.dtype, query.device, scaling, g,
+        block_n, num_warps, num_stages, target_programs,
+    )
+
+
 def nvfp4_flash_decode(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -2055,6 +2187,13 @@ def nvfp4_flash_decode(
     target_programs: int = 256,
 ) -> torch.Tensor:
     """Native-NVFP4 KV-cache decode attention (seqlen_q == 1).
+
+    Convenience path: quantizes Q/K/V from high precision on every call. Because
+    decode is HBM-bound, re-reading the whole bf16 cache to quantize it dominates
+    and makes this path roughly bf16-SDPA-parity at long context (worse for MHA
+    g=1, where there are more kv heads to re-quantize). For serving, store the
+    cache in NVFP4 via ``nvfp4_quant_kv_decode`` and call
+    ``nvfp4_flash_decode_prequant`` — that compute-only path beats bf16 SDPA.
 
     Args:
         query: ``[Z, H, 1, D]`` high precision (bf16/fp16/fp32). D in {128, 256}.
@@ -2074,16 +2213,7 @@ def nvfp4_flash_decode(
     assert h % hk == 0 and h // hk == num_key_value_groups
     assert d % 16 == 0 and d in (128, 256)
     g = num_key_value_groups
-    BLOCK_M = 16
-    assert g <= BLOCK_M, f"GQA group {g} must be <= {BLOCK_M}"
-
-    # choose split count so Z*Hk*NSPLIT ~ target_programs; SPLIT_KV multiple of block_n.
-    n_kblocks = triton.cdiv(s_kv, block_n)
-    want = max(1, target_programs // (z * hk))
-    nsplit = max(1, min(n_kblocks, want))
-    split_blocks = triton.cdiv(n_kblocks, nsplit)
-    split_kv = split_blocks * block_n
-    nsplit = triton.cdiv(s_kv, split_kv)  # recompute actual splits covering s_kv
+    assert g <= 16, f"GQA group {g} must be <= 16"
 
     s_kv_pad = _next_mult(s_kv, block_n)
     # pack query heads of each kv head into the row axis: [Z*Hk, G, D]
@@ -2091,38 +2221,16 @@ def nvfp4_flash_decode(
     k2 = key.reshape(z * hk, s_kv, d)
     v2 = value.reshape(z * hk, s_kv, d)
 
-    qnv, qsc = _quant_nvfp4(q2)
-    knv, ksc = _quant_nvfp4(k2)
-    vnv, vsc = _quant_nvfp4(v2, transpose=True, k_pad=s_kv_pad)
+    # one fused launch for the three packs (bit-identical to the separate calls);
+    # a small win at short seq, and avoids three Python/CUDA launch round-trips.
+    qnv, qsc, knv, ksc, vnv, vsc = _quant_qkv_fwd(q2, k2, v2, s_kv_pad)
 
-    op = torch.empty(z * hk, nsplit, BLOCK_M, d, device=query.device, dtype=torch.float32)
-    mp = torch.empty(z * hk, nsplit, BLOCK_M, device=query.device, dtype=torch.float32)
-    lp = torch.empty(z * hk, nsplit, BLOCK_M, device=query.device, dtype=torch.float32)
-
-    qnv_v, knv_v, vnv_v = qnv.view(torch.uint8), knv.view(torch.uint8), vnv.view(torch.uint8)
-    qsc_v, ksc_v, vsc_v = qsc.view(torch.uint8), ksc.view(torch.uint8), vsc.view(torch.uint8)
-
-    _flash_decode_kernel[(z * hk, nsplit)](
-        qnv_v, qsc_v, knv_v, ksc_v, vnv_v, vsc_v,
-        op, mp, lp,
-        scaling, s_kv, g, split_kv,
-        D=d,
-        sq_qn=qnv_v.stride(1), sq_sn=qsc_v.stride(1),
-        sk_kn=knv_v.stride(1), sk_sn=ksc_v.stride(1),
-        sv_kn=vnv_v.stride(1), sv_sn=vsc_v.stride(1),
-        NSPLIT=nsplit, BLOCK_M=BLOCK_M, BLOCK_N=block_n,
-        DP2=d // 2, DP16=d // 16, NP2=block_n // 2, NP16=block_n // 16,
-        num_warps=num_warps, num_stages=num_stages,
+    return _decode_compute(
+        qnv, qsc, knv, ksc, vnv, vsc,
+        z, h, hk, d, s_kv, s_kv_pad,
+        query.dtype, query.device, scaling, g,
+        block_n, num_warps, num_stages, target_programs,
     )
-
-    out = torch.empty(z, h, d, device=query.device, dtype=query.dtype)
-    _flash_decode_combine_kernel[(z * hk,)](
-        op, mp, lp, out,
-        g, HK=hk, D=d, NSPLIT=nsplit, BLOCK_M=BLOCK_M,
-        so_z=out.stride(0), so_h=out.stride(1),
-        num_warps=4,
-    )
-    return out.reshape(z, h, 1, d)
 
 
 # ---------------------------------------------------------------------------

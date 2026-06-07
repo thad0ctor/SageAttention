@@ -18,6 +18,8 @@ from .flash import (
     nvfp4_flash_attention_packed,
     nvfp4_flash_attn_func,
     nvfp4_flash_decode,
+    nvfp4_flash_decode_prequant,
+    nvfp4_quant_kv_decode,
 )
 
 __all__ = [
@@ -25,5 +27,7 @@ __all__ = [
     "nvfp4_flash_attention_packed",
     "nvfp4_flash_attn_func",
     "nvfp4_flash_decode",
+    "nvfp4_flash_decode_prequant",
+    "nvfp4_quant_kv_decode",
     "convert_fp32_to_fp4_packed",
 ]
