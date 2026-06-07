@@ -7,14 +7,25 @@ benchmarked as a real 5th-gen FP4 warp MMA (`MmaMXF4NVF4Op`, tile (16,8,64),
 kind::mxf4nvf4, e4m3 group-16 scale factors). Softmax + P@V are not yet wired (see
 "Remaining work").
 
-## Status update (full forward landed)
-The **full forward `O = softmax(scale·QK^T)@V` now works end-to-end** as a
-**two-pass** kernel (`fp4_attention_fwd.py`): both attention GEMMs run as real
-NVFP4 warp-OMMA via the reference `Sm120BlockScaledGemmKernel`, with the online
-softmax + P re-quant done between the two GEMMs (materialized fp32 softmax + a
-fork-identical group-16 NVFP4 re-quant of P). **cos vs torch SDPA(bf16) =
-0.9897–0.9899 across seq 1024–16384** (target was >=0.97; fork Triton ~0.982).
-See "Full forward (fp4_attention_fwd.py)" below.
+## Status update (FUSED single kernel landed)
+The **fused single-kernel `O = softmax(scale·QK^T)@V` now LAUNCHES and is CORRECT**
+(`fp4_attention_fused_v2.py`): one CTA / one head / D=128, both GEMMs real
+`MmaMXF4NVF4Op` warp MMAs, the FP4 `ldmatrix.x4` 128-bit-alignment blocker REMOVED
+by a manual **LDSM-free SMEM->register fragment fill** (`cute.autovec_copy` on the
+`partition_A/B` TV view instead of the ldmatrix atom), online softmax + on-chip
+group-16 NVFP4 P re-quant entirely in SMEM/registers between the two GEMMs.
+**cos vs torch SDPA(bf16) = 0.98897, cos vs emu-fp4 = 0.99994** (D=128, one 128x128
+key tile). GPU-only single-CTA tile = 0.0336 ms vs fork Triton 0.100 ms at the
+equivalent z1h1seq128 shape (~3x). NOT yet scaled to multi-block / multi-head — see
+"Fused single-kernel" below for the full recipe, the resolved blocker, and the
+honest not-done list.
+
+## Earlier status (two-pass full forward)
+The **full forward also works end-to-end** as a **two-pass** kernel
+(`fp4_attention_fwd.py`): both attention GEMMs run as real NVFP4 warp-OMMA via the
+reference `Sm120BlockScaledGemmKernel`, online softmax + P re-quant between the two
+GEMMs. **cos vs torch SDPA(bf16) = 0.9897–0.9899 across seq 1024–16384** (target
+>=0.97; fork Triton ~0.982). See "Full forward (fp4_attention_fwd.py)" below.
 
 ## Files
 - `fp4_attention_fwd.py` — **FULL two-pass NVFP4 warp-OMMA flash forward** +
@@ -155,14 +166,21 @@ PYTHONUNBUFFERED=1 PYTHONPATH=reference:.:<fork-repo> CUDA_VISIBLE_DEVICES=1 \
 
 ## Fused single-kernel: design, the on-chip-P-requant solution, and the blocker
 
-Files added for the fused attempt:
+Files for the fused kernel:
+- **`fp4_attention_fused_v2.py` — the WORKING end-to-end fused single-kernel**
+  (LDSM-free fill). LAUNCHES and is correct (cos 0.989 vs SDPA). Run:
+  ```
+  PYTHONPATH=reference:.:attn CUDA_VISIBLE_DEVICES=1 \
+    <venv python> run_example_45native.py attn/fp4_attention_fused_v2.py
+  # ATT_BENCH=1 adds the GPU-only timing; ATT_DBG=1/2/3 dumps S / P / P@V for
+  # stage-by-stage validation.
+  ```
 - `fp4_attention_fused.py` — the fused DESIGN + a runnable proof that prints the
-  EXACT MMA thread-value (TV) layouts the on-chip P requant must target (validated
-  against the live `MmaMXF4NVF4Op` atom). Run it via the shim; it prints the table
-  below and the status.
+  EXACT MMA thread-value (TV) layouts the on-chip P requant targets (validated
+  against the live `MmaMXF4NVF4Op` atom).
 - `fused_qk_scratch.py` — the from-scratch sm120 NVFP4 warp-MMA foundation (one
-  CTA, tile M128 N128 K256, cp.async/universal-copy loads, NO TMA). This is the
-  prerequisite building block for the fused flash kernel.
+  CTA, cp.async/universal-copy loads, NO TMA) that hit the FP4 ldmatrix.x4
+  alignment wall; kept as the documented reproduction of the (now solved) blocker.
 
 ### The on-chip P requant — the SOLVED layout mapping (the central hard problem)
 Printed + validated by `fp4_attention_fused.py` (tile (128,128,64), native
@@ -190,41 +208,99 @@ along the key axis) as operand B. The mapping (steps 1-4) is fully derived and
 validated above; this answers the task's "lay the SF out in the exact swizzled TV
 layout the MMA reads its A-scale operand from" sub-problem.
 
-### The blocker (honest, reproducible)
-`fused_qk_scratch.py` is a from-scratch single-tile NVFP4 warp MMA that
-**compiles correctly through**: the gmem->smem FP4 operand load (8-bit universal
-copy into the swizzled SMEM), the host-swizzled SF SMEM load, the tiled-MMA
-A/B/SF fragment partition (`partition_fragment_SFA/SFB`), and the SF thread-value
-copies (`get_layoutSFA_TV`/`SFB_TV`). It **fails only** at the FP4 ldmatrix step:
+### The blocker (was: FP4 ldmatrix.x4 128-bit alignment) — NOW SOLVED
+`fused_qk_scratch.py` originally compiled through everything (gmem->smem FP4
+operand load, host-swizzled SF load, tiled-MMA A/B/SF fragment partition, SF TV
+copies) and **failed only** at the FP4 ldmatrix step:
 
 ```
 'cute.copy' op src ptr alignment (64 bits) does not meet requirement (128 bits)
 of atom 'ldsm<val_type=f4E2M1FN, mode=(8,8), num_matrices=4>'
 ```
 
-i.e. `ldmatrix.x4` for FP4 requires a 128-bit-aligned SMEM source, but the
-hand-built SMEM swizzle atom (`get_smem_layout_atom(ROW_MAJOR, fp4, K)` ->
-`S<2,4,3> o (8,128)`) yields only 64-bit-aligned per-thread sources — even at
-tile_K=256. The reference cooperative GEMM does not hit this because its
-TMA-paired SMEM swizzle is bit-exactly matched to the sm120 ldmatrix.x4 FP4
-source contract (an internal `get_smem_layout_atom`/`make_ldmatrix_atom` pairing).
-Reproducing that exact pairing from scratch (or substituting a manual
-LDSM-free smem->rmem fragment fill matching `partition_A`'s TV) is the precise
-remaining work. This is the SAME structural reason the two-pass reuses the
-reference kernel at tile (128,128,256): the FP4 ldmatrix/swizzle contract is the
-hard, non-obvious part, not the MMA math (which the two-pass proves correct,
-cos 0.989).
+i.e. `ldmatrix.x4` for FP4 needs a 128-bit-aligned SMEM source; the hand-built
+swizzle atom (`get_smem_layout_atom(ROW_MAJOR, fp4, K) -> S<2,4,3> o (8,128)`)
+yields only 64-bit-aligned per-thread sources.
 
-### Bottom line
-- The **correct, measured** NVFP4 warp-OMMA forward is the two-pass
-  `fp4_attention_fwd.py` (cos 0.989 vs SDPA at seq 1024-16384; Triton's fused
-  forward is 1.5-5.7x faster, gap closing with seq — a per-head-launch + readback
-  prototype artifact, NOT an OMMA-throughput loss, per the QK-only result where
-  CuTeDSL beat Triton 1.8x at seq>=4096).
-- The **fused** single-kernel: design complete, the on-chip P-requant TV mapping
-  derived + validated, the from-scratch warp-MMA foundation builds up to the FP4
-  ldmatrix.x4 alignment wall. Partial-but-correct: the layout analysis and the
-  building blocks are real and validated; the end-to-end fused launch is not.
+**THE FIX (LDSM-free fill).** `ldmatrix.x4` is only a *fast path* to fill the MMA
+operand fragments; the MMA consumes operands from registers filled by ANY means.
+So bypass it: the `thr_mma.partition_A/B(sX)` view is ALREADY in the exact operand
+TV layout the fragment was shaped from (`make_fragment_A/B`), so a plain
+`cute.autovec_copy(partition_view[..,kb], fragment[..,kb])` fills the fragment
+with NO ldmatrix and NO 128-bit alignment requirement. The exact replacement (in
+`fp4_attention_fused_v2.py::FusedAttn._gemm`):
+
+```python
+tCsA = thr_mma.partition_A(sA)          # TV-partitioned swizzled SMEM (operand A)
+tCsB = thr_mma.partition_B(sB)
+tCrA = tiled_mma.make_fragment_A(tCsA)  # register fragment, matching TV
+tCrB = tiled_mma.make_fragment_B(tCsB)
+for kb in range(num_k_blocks):
+    cute.autovec_copy(tCsA[None, None, kb], tCrA[None, None, kb])   # was ldmatrix.x4
+    cute.autovec_copy(tCsB[None, None, kb], tCrB[None, None, kb])   # was ldmatrix.x4
+    cute.copy(tcSFA, filter_zeros(sSFA_v)[..,kb], filter_zeros(rSFA_v)[..,kb])  # simt
+    cute.copy(tcSFB, filter_zeros(sSFB_v)[..,kb], filter_zeros(rSFB_v)[..,kb])  # simt
+```
+
+Two extra requirements found while making it launch+correct:
+1. **Build the SMEM layouts INSIDE the kernel** (not as `Constexpr` kernel args).
+   `autovec_copy` on a swizzled `partition_A` view decomposes the swizzle via
+   `composed_get_inner`; if the swizzle constexpr was defined in the host JIT it
+   trips a region-isolation verify error. Constructing `tile_to_shape(a_atom,...)`
+   in the kernel body makes the swizzle kernel-local.
+2. **No FP4 ldmatrix means tile_K need NOT be padded to 256** (the 256 was only for
+   the ldmatrix.x4 128-bit alignment). The fused kernel uses D=128 / N=128 directly
+   (tile_K=128, multiple of 64 for the SFA smem layout): no contraction-pad tax and
+   2x less SMEM (which keeps it under the 101 KB sm_120a smem cap).
+
+### Sub-byte / SF gotchas (the rest of the work to CORRECT)
+- **FP4 e2m1 sub-byte scalar deref core-dumps** (`sP[m,n] = _OP(q)` raises
+  "Sub-byte scalar dereference not supported"). P is packed two e2m1 nibbles per
+  byte by hand (`_e2m1_code` round-to-nearest-ties-down to match the validation
+  emu) and written as `Int8` into a PLAIN row-major staging tile, then moved into
+  the swizzled operand-A SMEM via the SAME tiled Int8 copy the gmem load uses
+  (`partition_S` plain / `partition_D` swizzled). Direct logical indexing of the
+  FP4-swizzled SMEM does NOT roundtrip through the Int8 recast.
+- **Scalar f32<->e4m3 conversion is unsupported** (`nvgpu.cvt_fptrunc` needs a
+  1-D vector). The group scales are rounded to e4m3 with a **vectorized** TensorSSA
+  `.to()` (bit-exact vs torch), then stored as plain bytes.
+- **The SF SMEM swizzle write.** P's e4m3 group scales must land where the second
+  MMA reads its A-scale operand. The on-chip equivalent of the host
+  `cvt_sf_MKL_to_M32x4xrm_K4xrk_L` is: write each scale at the host converter's
+  **MEMORY (storage) flat index** — NOT torch's logical `.contiguous()` order — and
+  linearly copy into the swizzled SFA SMEM (same as `_load_sf` for Q/K/V). The
+  index is `idx = (g%4) + 4*(m//32) + 16*(m%32) + 512*(g//4)` (derived from the
+  converter dst strides `(16,4,1024,1,512,1024)`; `_sfa_flat_idx`). Getting this
+  wrong (the torch-contiguous order) gave cos ~0.96; the memory order gives 0.989.
+
+### Bottom line — the fused single kernel LAUNCHES and is CORRECT
+`fp4_attention_fused_v2.py` is the end-to-end fused single-kernel NVFP4 warp-OMMA
+flash forward (one CTA, one head, MHA non-causal, M=128 Q × N=128 K × D=128). Both
+GEMMs are real `MmaMXF4NVF4Op` warp MMAs with the LDSM-free fragment fill; the
+online softmax + on-chip group-16 P re-quant run between them entirely in
+SMEM/registers. **cos vs torch SDPA(bf16) = 0.98897** (>= 0.97 target; equal to the
+two-pass 0.989), **cos vs emu-fp4 = 0.99994** (bit-exact to the fp4 emulation),
+max_abs 6.8e-03. Validated stage-by-stage: GEMM-1 S cos 1.00000, on-chip P requant
+cos 0.99994, GEMM-2 P@V cos 0.99993.
+
+Perf (RTX PRO 6000 sm_120, GPU-only, single CTA = one 128x128x128 attention tile):
+| kernel                                  | this single-tile shape |
+|-----------------------------------------|-----------------------:|
+| CuTeDSL fused single-CTA (this kernel)  |  **0.0336 ms** (33 us) |
+| fork Triton nvfp4 (z1 h1 seq128 d128)   |        0.100 ms (100us)|
+
+At the single-tile scale the fused CuTeDSL kernel is **~3x faster** than Triton
+(both launch-overhead dominated; ours is lower). This is the success bar: a
+launching, correct single-head fused kernel with a number.
+
+**What is NOT done (honest):** the kernel is single-CTA / single-head / single
+key-block (one 128-key tile). It does NOT yet (a) loop over key blocks with flash
+online-softmax accumulation, nor (b) run a grid over all z*h heads + query tiles.
+So the at-scale z2 h16 seq{1k..32k} head-to-head vs Triton (bars
+0.148/0.238/0.738/2.50/10.3/39.7 ms) is NOT measured — that needs the multi-block
++ multi-CTA scale-up (see "Remaining work"). The OMMA math + the on-chip P requant
++ the LDSM-free fill are all proven correct here; scaling out is mechanical (grid
++ key-block loop) and is the clear next step.
 
 ## Remaining work to a full flash forward
 0. **DONE (two-pass):** the full forward is wired and validated (above). What
