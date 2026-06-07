@@ -17,11 +17,13 @@ from .flash import (
     nvfp4_flash_attention,
     nvfp4_flash_attention_packed,
     nvfp4_flash_attn_func,
+    nvfp4_flash_decode,
 )
 
 __all__ = [
     "nvfp4_flash_attention",
     "nvfp4_flash_attention_packed",
     "nvfp4_flash_attn_func",
+    "nvfp4_flash_decode",
     "convert_fp32_to_fp4_packed",
 ]

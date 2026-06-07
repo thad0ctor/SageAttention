@@ -1855,6 +1855,277 @@ def nvfp4_flash_attention(
 
 
 # ---------------------------------------------------------------------------
+# NVFP4 KV-cache DECODE (seqlen_q == 1, GQA). Two-pass flash-decoding:
+#   pass 1 (_flash_decode_kernel): each program owns one (z, kv_head, kv_split)
+#     and computes a PARTIAL attention over its key chunk for the G query heads
+#     of that kv head, which are PACKED into the MMA M dimension (M = BLOCK_M,
+#     G valid rows). This avoids the prefill kernel's 128x waste at q_len=1 and
+#     parallelizes across KV so few query rows still saturate the GPU.
+#   pass 2 (_flash_decode_combine_kernel): online-softmax reduction across the
+#     splits -> final output.
+# Both QK^T and P@V run as native NVFP4 tl.dot_scaled ops (same as the prefill
+# kernel); the KV cache is stored as NVFP4 (4x vs bf16). BLOCK_M is the MMA m
+# tile (16); GQA group G must be <= BLOCK_M.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _flash_decode_kernel(
+    qnv_ptr,
+    qsc_ptr,  # [Z*HK, G, D//2], [Z*HK, G, D//16]
+    knv_ptr,
+    ksc_ptr,  # [Z*HK, Skv, D//2], [Z*HK, Skv, D//16]
+    vnv_ptr,
+    vsc_ptr,  # [Z*HK, D, Sp//2], [Z*HK, D, Sp//16]  (V^T, quant on key)
+    op_ptr,  # [Z*HK, NSPLIT, BLOCK_M, D] fp32 partial (un-normalized acc)
+    mp_ptr,  # [Z*HK, NSPLIT, BLOCK_M] fp32 running max
+    lp_ptr,  # [Z*HK, NSPLIT, BLOCK_M] fp32 running sum-exp
+    scaling,
+    Skv,
+    G,
+    SPLIT_KV,  # keys per split (multiple of BLOCK_N)
+    D: tl.constexpr,
+    sq_qn,
+    sq_sn,
+    sk_kn,
+    sk_sn,
+    sv_kn,
+    sv_sn,
+    NSPLIT: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    DP2: tl.constexpr,
+    DP16: tl.constexpr,
+    NP2: tl.constexpr,
+    NP16: tl.constexpr,
+):
+    pid_zhk = tl.program_id(0)
+    pid_s = tl.program_id(1)
+
+    offs_m = tl.arange(0, BLOCK_M)
+    mmask = offs_m < G
+    offs_dp = tl.arange(0, DP2)
+    offs_dsc = tl.arange(0, DP16)
+
+    # load the G packed query rows for this kv head: [BLOCK_M, D//2] + scale
+    qbase = pid_zhk * (G * sq_qn)
+    qscbase = pid_zhk * (G * sq_sn)
+    qnv = tl.load(
+        qnv_ptr + qbase + offs_m[:, None] * sq_qn + offs_dp[None, :],
+        mask=mmask[:, None],
+        other=0,
+    )
+    qsc = tl.load(
+        qsc_ptr + qscbase + offs_m[:, None] * sq_sn + offs_dsc[None, :],
+        mask=mmask[:, None],
+        other=0,
+    ).to(tl.float8e4nv, bitcast=True)
+
+    m_i = tl.full((BLOCK_M,), _NEG_INF, dtype=tl.float32)
+    l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_M, D), dtype=tl.float32)
+
+    kbase = pid_zhk * (Skv * sk_kn)
+    kscbase = pid_zhk * (Skv * sk_sn)
+    vbase = pid_zhk * (D * sv_kn)
+    vscbase = pid_zhk * (D * sv_sn)
+
+    offs_n0 = tl.arange(0, BLOCK_N)
+    offs_np = tl.arange(0, NP2)
+    offs_nsc = tl.arange(0, NP16)
+    offs_d = tl.arange(0, D)
+
+    start = pid_s * SPLIT_KV
+    hi = tl.minimum(Skv, start + SPLIT_KV)
+    for start_n in range(start, hi, BLOCK_N):
+        offs_n = start_n + offs_n0
+        nmask = offs_n < Skv
+        knv = tl.load(
+            knv_ptr + kbase + offs_n[:, None] * sk_kn + offs_dp[None, :],
+            mask=nmask[:, None],
+            other=0,
+        )
+        ksc = tl.load(
+            ksc_ptr + kscbase + offs_n[:, None] * sk_sn + offs_dsc[None, :],
+            mask=nmask[:, None],
+            other=0,
+        ).to(tl.float8e4nv, bitcast=True)
+        s = tl.dot_scaled(qnv, qsc, "e2m1", knv.T, ksc, "e2m1")
+        s = s * scaling
+        s = tl.where(nmask[None, :], s, _NEG_INF)
+
+        m_new = tl.maximum(m_i, tl.max(s, axis=1))
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(s - m_new[:, None])
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        acc = acc * alpha[:, None]
+
+        pb = p.reshape(BLOCK_M, NP16, 16)
+        pamax = tl.max(pb, axis=2)
+        psc = tl.clamp(pamax / _F4_MAX, _E4M3_EPS, _F8E4M3_MAX).to(tl.float8e4nv)
+        pn = pb / psc.to(tl.float32)[:, :, None]
+        ppairs = pn.reshape(BLOCK_M * NP2, 2).split()
+        pq = convert_fp32_to_fp4_packed(ppairs).reshape(BLOCK_M, NP2)
+
+        vnv = tl.load(
+            vnv_ptr + vbase + offs_d[:, None] * sv_kn + (start_n // 2 + offs_np)[None, :],
+        )
+        vsc = tl.load(
+            vsc_ptr + vscbase + offs_d[:, None] * sv_sn + (start_n // 16 + offs_nsc)[None, :],
+        ).to(tl.float8e4nv, bitcast=True)
+        acc = tl.dot_scaled(pq, psc, "e2m1", vnv.T, vsc, "e2m1", acc=acc)
+        m_i = m_new
+
+    obase = (pid_zhk * NSPLIT + pid_s) * (BLOCK_M * D)
+    tl.store(
+        op_ptr + obase + offs_m[:, None] * D + offs_d[None, :],
+        acc,
+        mask=mmask[:, None],
+    )
+    mlbase = (pid_zhk * NSPLIT + pid_s) * BLOCK_M
+    tl.store(mp_ptr + mlbase + offs_m, m_i, mask=mmask)
+    tl.store(lp_ptr + mlbase + offs_m, l_i, mask=mmask)
+
+
+@triton.jit
+def _flash_decode_combine_kernel(
+    op_ptr,  # [Z*HK, NSPLIT, BLOCK_M, D]
+    mp_ptr,
+    lp_ptr,  # [Z*HK, NSPLIT, BLOCK_M]
+    out_ptr,  # [Z, H, D]  (q_len==1 squeezed)
+    G,
+    HK: tl.constexpr,
+    D: tl.constexpr,
+    NSPLIT: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    so_z,
+    so_h,
+):
+    pid_zhk = tl.program_id(0)
+    offs_m = tl.arange(0, BLOCK_M)
+    mmask = offs_m < G
+    offs_d = tl.arange(0, D)
+
+    # global max over splits
+    gm = tl.full((BLOCK_M,), _NEG_INF, dtype=tl.float32)
+    for s in range(NSPLIT):
+        mlbase = (pid_zhk * NSPLIT + s) * BLOCK_M
+        msp = tl.load(mp_ptr + mlbase + offs_m, mask=mmask, other=_NEG_INF)
+        gm = tl.maximum(gm, msp)
+
+    acc = tl.zeros((BLOCK_M, D), dtype=tl.float32)
+    denom = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    for s in range(NSPLIT):
+        mlbase = (pid_zhk * NSPLIT + s) * BLOCK_M
+        msp = tl.load(mp_ptr + mlbase + offs_m, mask=mmask, other=_NEG_INF)
+        lsp = tl.load(lp_ptr + mlbase + offs_m, mask=mmask, other=0.0)
+        f = tl.exp(msp - gm)
+        f = tl.where(msp == _NEG_INF, 0.0, f)
+        obase = (pid_zhk * NSPLIT + s) * (BLOCK_M * D)
+        osp = tl.load(
+            op_ptr + obase + offs_m[:, None] * D + offs_d[None, :],
+            mask=mmask[:, None],
+            other=0.0,
+        )
+        acc += f[:, None] * osp
+        denom += f * lsp
+
+    denom = tl.where(denom == 0.0, 1.0, denom)
+    out = acc / denom[:, None]
+
+    # this program owns kv head kh of batch z; its G rows are query heads
+    # [kh*G, kh*G + G). out layout [Z, H, D]: row r -> head kh*G + r.
+    z = pid_zhk // HK
+    kh = pid_zhk % HK
+    obase = z * so_z + (kh * G) * so_h
+    tl.store(
+        out_ptr + obase + offs_m[:, None] * so_h + offs_d[None, :],
+        out.to(out_ptr.dtype.element_ty),
+        mask=mmask[:, None],
+    )
+
+
+def nvfp4_flash_decode(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    scaling: float,
+    num_key_value_groups: int = 1,
+    block_n: int = 128,
+    num_warps: int = 4,
+    num_stages: int = 3,
+    target_programs: int = 256,
+) -> torch.Tensor:
+    """Native-NVFP4 KV-cache decode attention (seqlen_q == 1).
+
+    Args:
+        query: ``[Z, H, 1, D]`` high precision (bf16/fp16/fp32). D in {128, 256}.
+        key/value: ``[Z, Hk, Skv, D]`` (pre-repeat_kv GQA), quantized to NVFP4.
+        scaling: softmax scale (e.g. ``1/sqrt(D)``).
+        num_key_value_groups: ``G = H // Hk``. Must be <= 16 (the MMA m tile);
+            the G query heads of each kv head are packed into the MMA M dim.
+        target_programs: split the key axis so total programs (Z*Hk*splits) is
+            ~this many, to saturate the GPU for small Z*Hk.
+
+    Returns:
+        Attention output ``[Z, H, 1, D]`` in ``query.dtype``.
+    """
+    z, h, s_q, d = query.shape
+    _, hk, s_kv, _ = key.shape
+    assert s_q == 1, "nvfp4_flash_decode is for seqlen_q == 1 (decode)"
+    assert h % hk == 0 and h // hk == num_key_value_groups
+    assert d % 16 == 0 and d in (128, 256)
+    g = num_key_value_groups
+    BLOCK_M = 16
+    assert g <= BLOCK_M, f"GQA group {g} must be <= {BLOCK_M}"
+
+    # choose split count so Z*Hk*NSPLIT ~ target_programs; SPLIT_KV multiple of block_n.
+    n_kblocks = triton.cdiv(s_kv, block_n)
+    want = max(1, target_programs // (z * hk))
+    nsplit = max(1, min(n_kblocks, want))
+    split_blocks = triton.cdiv(n_kblocks, nsplit)
+    split_kv = split_blocks * block_n
+    nsplit = triton.cdiv(s_kv, split_kv)  # recompute actual splits covering s_kv
+
+    s_kv_pad = _next_mult(s_kv, block_n)
+    # pack query heads of each kv head into the row axis: [Z*Hk, G, D]
+    q2 = query.reshape(z, hk, g, d).reshape(z * hk, g, d)
+    k2 = key.reshape(z * hk, s_kv, d)
+    v2 = value.reshape(z * hk, s_kv, d)
+
+    qnv, qsc = _quant_nvfp4(q2)
+    knv, ksc = _quant_nvfp4(k2)
+    vnv, vsc = _quant_nvfp4(v2, transpose=True, k_pad=s_kv_pad)
+
+    op = torch.empty(z * hk, nsplit, BLOCK_M, d, device=query.device, dtype=torch.float32)
+    mp = torch.empty(z * hk, nsplit, BLOCK_M, device=query.device, dtype=torch.float32)
+    lp = torch.empty(z * hk, nsplit, BLOCK_M, device=query.device, dtype=torch.float32)
+
+    qnv_v, knv_v, vnv_v = qnv.view(torch.uint8), knv.view(torch.uint8), vnv.view(torch.uint8)
+    qsc_v, ksc_v, vsc_v = qsc.view(torch.uint8), ksc.view(torch.uint8), vsc.view(torch.uint8)
+
+    _flash_decode_kernel[(z * hk, nsplit)](
+        qnv_v, qsc_v, knv_v, ksc_v, vnv_v, vsc_v,
+        op, mp, lp,
+        scaling, s_kv, g, split_kv,
+        D=d,
+        sq_qn=qnv_v.stride(1), sq_sn=qsc_v.stride(1),
+        sk_kn=knv_v.stride(1), sk_sn=ksc_v.stride(1),
+        sv_kn=vnv_v.stride(1), sv_sn=vsc_v.stride(1),
+        NSPLIT=nsplit, BLOCK_M=BLOCK_M, BLOCK_N=block_n,
+        DP2=d // 2, DP16=d // 16, NP2=block_n // 2, NP16=block_n // 16,
+        num_warps=num_warps, num_stages=num_stages,
+    )
+
+    out = torch.empty(z, h, d, device=query.device, dtype=query.dtype)
+    _flash_decode_combine_kernel[(z * hk,)](
+        op, mp, lp, out,
+        g, HK=hk, D=d, NSPLIT=nsplit, BLOCK_M=BLOCK_M,
+        so_z=out.stride(0), so_h=out.stride(1),
+        num_warps=4,
+    )
+    return out.reshape(z, h, 1, d)
+
+
+# ---------------------------------------------------------------------------
 # Full forward + native-NVFP4 backward as a torch.autograd.Function.
 # ---------------------------------------------------------------------------
 def _run_bwd(

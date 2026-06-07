@@ -23,6 +23,7 @@ if _SKIP_REASON is None:
     from sageattention.nvfp4 import (
         nvfp4_flash_attention,
         nvfp4_flash_attn_func,
+        nvfp4_flash_decode,
     )
 
 
@@ -61,6 +62,32 @@ def test_forward_parity(causal, hk):
         out = nvfp4_flash_attention(
             q, k, v, scaling, causal=causal, num_key_value_groups=groups
         )
+    except Exception as exc:  # noqa: BLE001
+        _skip_if_unsupported(exc)
+
+    assert out.shape == ref.shape
+    assert torch.isfinite(out).all()
+    assert _cos(out, ref) > 0.95
+
+
+@pytest.mark.parametrize("hk", [8, 2, 32])  # g=4 (GQA), g=16, g=1 (MHA)
+@pytest.mark.parametrize("s_kv", [777, 4096])  # non-multiple + long context
+def test_decode_parity(hk, s_kv):
+    torch.manual_seed(0)
+    z, h, d = 2, 32, 128
+    scaling = 1.0 / math.sqrt(d)
+    groups = h // hk
+
+    q = torch.randn(z, h, 1, d, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(z, hk, s_kv, d, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(z, hk, s_kv, d, device="cuda", dtype=torch.bfloat16)
+
+    k_ref = k.repeat_interleave(groups, dim=1)
+    v_ref = v.repeat_interleave(groups, dim=1)
+    ref = F.scaled_dot_product_attention(q, k_ref, v_ref, scale=scaling)
+
+    try:
+        out = nvfp4_flash_decode(q, k, v, scaling, num_key_value_groups=groups)
     except Exception as exc:  # noqa: BLE001
         _skip_if_unsupported(exc)
 
