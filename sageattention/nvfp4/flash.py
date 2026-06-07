@@ -377,6 +377,177 @@ def _quant_nvfp4_dual(
 
 
 # ---------------------------------------------------------------------------
+# Fused forward Q/K/V NVFP4 pre-quant in a SINGLE kernel launch. Replaces the
+# three separate _quant_nvfp4 launches (Q along-D, K along-D, V along-key^T) that
+# at short seqlen are dominated by per-launch Python+CUDA overhead (~21us each,
+# barely scaling with size). A 2-D grid (max_row_tiles, 3) selects the operand on
+# axis-1; each program packs one [BLOCK_R, group*16] sub-tile.
+#
+# Bit-identical to the standalone calls: every group of 16 is reduced/scaled/
+# packed independently and 16 divides every tile boundary, so packing is invariant
+# to how the contraction is tiled.
+#   Q: x=q [BQ, Sq, D]  -> along-D   qnv [BQ, Sq, D//2], qsc [BQ, Sq, D//16]
+#   K: x=k [BK, Skv, D] -> along-D   knv [BK, Skv, D//2], ksc [BK, Skv, D//16]
+#   V: x=v [BK, Skv, D] -> along-key vnv [BK, D, Sp//2],  vsc [BK, D, Sp//16]
+#      (V^T via strided reads, key axis padded to Sp; padded groups -> eps scale.)
+# ---------------------------------------------------------------------------
+@triton.jit
+def _quant_qkv_fwd_kernel(
+    q_ptr, qnv_ptr, qsc_ptr,
+    k_ptr, knv_ptr, ksc_ptr,
+    v_ptr, vnv_ptr, vsc_ptr,
+    Sq, Skv, Sp,
+    BQ, BK,
+    # Q strides
+    sq_xb, sq_xr, sq_xd, sq_qb, sq_qr, sq_sb, sq_sr,
+    # K strides
+    sk_xb, sk_xr, sk_xd, sk_qb, sk_qr, sk_sb, sk_sr,
+    # V strides (source v [BK, Skv, D]: row=D via sv_xd, contraction=key via sv_xk)
+    sv_xb, sv_xd, sv_xk, sv_qb, sv_qr, sv_sb, sv_sr,
+    NQ, NK,                   # flat-grid section sizes (num Q-tiles, num K-tiles)
+    D: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    BLOCK_KD: tl.constexpr,   # along-D contraction block for Q/K (= D)
+    BLOCK_KV: tl.constexpr,   # along-key contraction block for V
+):
+    # Flat 1-D grid: [0, NQ) -> Q-tiles, [NQ, NQ+NK) -> K-tiles, rest -> V-tiles.
+    # No wasted programs (the old 2-D (max,3) grid launched many early-return ones).
+    gid = tl.program_id(0)
+    if gid < NQ:
+        sec = 0
+        pid = gid
+    elif gid < NQ + NK:
+        sec = 1
+        pid = gid - NQ
+    else:
+        sec = 2
+        pid = gid - NQ - NK
+    if sec == 0:
+        # ---- Q: along-D pack ----
+        n_rt = tl.cdiv(Sq, BLOCK_R)
+        b = pid // n_rt
+        rt = pid % n_rt
+        if b < BQ:
+            offs_r = rt * BLOCK_R + tl.arange(0, BLOCK_R)
+            offs_k = tl.arange(0, BLOCK_KD)
+            rmask = offs_r < Sq
+            x = tl.load(
+                q_ptr + b * sq_xb + offs_r[:, None] * sq_xr + offs_k[None, :] * sq_xd,
+                mask=rmask[:, None], other=0.0,
+            ).to(tl.float32)
+            NG: tl.constexpr = BLOCK_KD // 16
+            xb = x.reshape(BLOCK_R, NG, 16)
+            sc = tl.clamp(tl.max(tl.abs(xb), axis=2) / _F4_MAX, _E4M3_EPS, _F8E4M3_MAX).to(tl.float8e4nv)
+            xn = xb / sc.to(tl.float32)[:, :, None]
+            qpk = convert_fp32_to_fp4_packed(xn.reshape(BLOCK_R * (BLOCK_KD // 2), 2).split()).reshape(BLOCK_R, BLOCK_KD // 2)
+            offs_qk = tl.arange(0, BLOCK_KD // 2)
+            tl.store(qnv_ptr + b * sq_qb + offs_r[:, None] * sq_qr + offs_qk[None, :], qpk, mask=rmask[:, None])
+            offs_sk = tl.arange(0, NG)
+            tl.store(qsc_ptr + b * sq_sb + offs_r[:, None] * sq_sr + offs_sk[None, :],
+                     sc.to(tl.uint8, bitcast=True), mask=rmask[:, None])
+    elif sec == 1:
+        # ---- K: along-D pack ----
+        n_rt = tl.cdiv(Skv, BLOCK_R)
+        b = pid // n_rt
+        rt = pid % n_rt
+        if b < BK:
+            offs_r = rt * BLOCK_R + tl.arange(0, BLOCK_R)
+            offs_k = tl.arange(0, BLOCK_KD)
+            rmask = offs_r < Skv
+            x = tl.load(
+                k_ptr + b * sk_xb + offs_r[:, None] * sk_xr + offs_k[None, :] * sk_xd,
+                mask=rmask[:, None], other=0.0,
+            ).to(tl.float32)
+            NG: tl.constexpr = BLOCK_KD // 16
+            xb = x.reshape(BLOCK_R, NG, 16)
+            sc = tl.clamp(tl.max(tl.abs(xb), axis=2) / _F4_MAX, _E4M3_EPS, _F8E4M3_MAX).to(tl.float8e4nv)
+            xn = xb / sc.to(tl.float32)[:, :, None]
+            qpk = convert_fp32_to_fp4_packed(xn.reshape(BLOCK_R * (BLOCK_KD // 2), 2).split()).reshape(BLOCK_R, BLOCK_KD // 2)
+            offs_qk = tl.arange(0, BLOCK_KD // 2)
+            tl.store(knv_ptr + b * sk_qb + offs_r[:, None] * sk_qr + offs_qk[None, :], qpk, mask=rmask[:, None])
+            offs_sk = tl.arange(0, NG)
+            tl.store(ksc_ptr + b * sk_sb + offs_r[:, None] * sk_sr + offs_sk[None, :],
+                     sc.to(tl.uint8, bitcast=True), mask=rmask[:, None])
+    else:
+        # ---- V: along-key^T pack (rows = D, contraction = key, padded to Sp) ----
+        n_kt = tl.cdiv(Sp, BLOCK_KV)
+        b = pid // n_kt
+        kt = pid % n_kt
+        if b < BK:
+            offs_r = tl.arange(0, D)             # D rows (<= 256, one block)
+            offs_k = kt * BLOCK_KV + tl.arange(0, BLOCK_KV)
+            kmask = offs_k < Skv                 # padded keys read 0.0
+            x = tl.load(
+                v_ptr + b * sv_xb + offs_r[:, None] * sv_xd + offs_k[None, :] * sv_xk,
+                mask=kmask[None, :], other=0.0,
+            ).to(tl.float32)
+            NG: tl.constexpr = BLOCK_KV // 16
+            xb = x.reshape(D, NG, 16)
+            sc = tl.clamp(tl.max(tl.abs(xb), axis=2) / _F4_MAX, _E4M3_EPS, _F8E4M3_MAX).to(tl.float8e4nv)
+            xn = xb / sc.to(tl.float32)[:, :, None]
+            qpk = convert_fp32_to_fp4_packed(xn.reshape(D * (BLOCK_KV // 2), 2).split()).reshape(D, BLOCK_KV // 2)
+            offs_qk = kt * (BLOCK_KV // 2) + tl.arange(0, BLOCK_KV // 2)
+            tl.store(vnv_ptr + b * sv_qb + offs_r[:, None] * sv_qr + offs_qk[None, :], qpk,
+                     mask=offs_qk[None, :] < (Sp // 2))
+            offs_sk = kt * NG + tl.arange(0, NG)
+            tl.store(vsc_ptr + b * sv_sb + offs_r[:, None] * sv_sr + offs_sk[None, :],
+                     sc.to(tl.uint8, bitcast=True), mask=offs_sk[None, :] < (Sp // 16))
+
+
+def _quant_qkv_fwd(q2, k2, v2, s_kv_pad):
+    """One-launch NVFP4 pre-quant of Q (along-D), K (along-D), V (along-key^T).
+
+    q2 ``[BQ, Sq, D]``, k2/v2 ``[BK, Skv, D]`` (contiguous hp). Returns
+    ``(qnv, qsc, knv, ksc, vnv, vsc)`` exactly matching the three standalone
+    ``_quant_nvfp4`` calls. Folds three kernel launches + three Python wrappers
+    into one — a pure short-seq overhead win.
+    """
+    BQ, Sq, D = q2.shape
+    BK, Skv, _ = k2.shape
+    assert D % 16 == 0
+    assert s_kv_pad % 16 == 0 and s_kv_pad >= Skv
+    q2 = q2.contiguous()
+    k2 = k2.contiguous()
+    v2 = v2.contiguous()
+    qnv = q2.new_empty(BQ, Sq, D // 2, dtype=torch.uint8)
+    qsc = q2.new_empty(BQ, Sq, D // 16, dtype=torch.uint8)
+    knv = k2.new_empty(BK, Skv, D // 2, dtype=torch.uint8)
+    ksc = k2.new_empty(BK, Skv, D // 16, dtype=torch.uint8)
+    vnv = v2.new_empty(BK, D, s_kv_pad // 2, dtype=torch.uint8)
+    vsc = v2.new_empty(BK, D, s_kv_pad // 16, dtype=torch.uint8)
+    BLOCK_R = 64
+    BLOCK_KD = D
+    # V's along-key tile: a NARROW BLOCK_KV (64) with 2 warps + deep pipelining
+    # maximizes occupancy across the small V workload. The old wide BLOCK_KV=256 at
+    # the Triton-default warp count was ~2.3x slower (under-occupied, strided reads).
+    # 16 | BLOCK_KV so groups never straddle (keeps bit-parity).
+    BLOCK_KV = min(triton.next_power_of_2(s_kv_pad), 64)
+    nq = BQ * triton.cdiv(Sq, BLOCK_R)
+    nk = BK * triton.cdiv(Skv, BLOCK_R)
+    nv = BK * triton.cdiv(s_kv_pad, BLOCK_KV)
+    grid = (nq + nk + nv,)
+    _quant_qkv_fwd_kernel[grid](
+        q2, qnv, qsc,
+        k2, knv, ksc,
+        v2, vnv, vsc,
+        Sq, Skv, s_kv_pad,
+        BQ, BK,
+        q2.stride(0), q2.stride(1), q2.stride(2), qnv.stride(0), qnv.stride(1), qsc.stride(0), qsc.stride(1),
+        k2.stride(0), k2.stride(1), k2.stride(2), knv.stride(0), knv.stride(1), ksc.stride(0), ksc.stride(1),
+        # V source: row=D (stride sv_xd=v2.stride(2)), contraction=key (sv_xk=v2.stride(1))
+        v2.stride(0), v2.stride(2), v2.stride(1), vnv.stride(0), vnv.stride(1), vsc.stride(0), vsc.stride(1),
+        nq, nk,
+        D=D,
+        BLOCK_R=BLOCK_R,
+        BLOCK_KD=BLOCK_KD,
+        BLOCK_KV=BLOCK_KV,
+        num_warps=2,
+        num_stages=3,
+    )
+    return qnv, qsc.view(torch.float8_e4m3fn), knv, ksc.view(torch.float8_e4m3fn), vnv, vsc.view(torch.float8_e4m3fn)
+
+
+# ---------------------------------------------------------------------------
 # Fused flash forward. Grid: (num_q_blocks, Z*H). Each program owns one Q-block
 # of one (z, head); it indexes the matching KV head for GQA.
 # ---------------------------------------------------------------------------
@@ -554,6 +725,12 @@ def _next_mult(n: int, m: int) -> int:
 # to 2.0x (S8192) the D=256-style narrow default. (block_m, block_n, num_warps, num_stages).
 _FWD_TILE = {256: (64, 128, 8, 3), 128: (128, 128, 8, 2)}
 _FWD_TILE_DEFAULT = (64, 128, 8, 3)
+
+# Below this seqlen the forward pre-quant is launch/overhead bound, so folding the
+# three Q/K/V quant launches into one (`_quant_qkv_fwd`) wins. Above it, V's
+# in-kernel key loop under-parallelizes vs three separate grids, so we revert to
+# the standalone launches. (Swept on sm_120; crossover is between 2048 and 4096.)
+_FWD_FUSED_QUANT_MAX_SEQ = 3072
 
 
 def _resolve_fwd_tiles(d, block_m, block_n, num_warps, num_stages):
@@ -1555,9 +1732,16 @@ def nvfp4_flash_attention(
     _, hk, s_kv, _ = key.shape
     assert h % hk == 0 and h // hk == num_key_value_groups
     assert d % 16 == 0 and d in (128, 256)
+    user_tiles = (block_m, block_n, num_warps, num_stages) != _FWD_TILE_DEFAULT
     block_m, block_n, num_warps, num_stages = _resolve_fwd_tiles(
         d, block_m, block_n, num_warps, num_stages
     )
+    # Short non-causal d=128: a narrower key tile with fewer warps + an extra
+    # pipeline stage (BLOCK_N=64, warps=4, stages=3) measured ~13% faster than the
+    # long-seq default (BLOCK_N=128, warps=8, stages=2) on sm_120 — at S<=1024 the
+    # wide tile under-fills. Only when the caller didn't override the tiles.
+    if (not user_tiles) and (not causal) and d == 128 and s_q <= 1024 and s_kv <= 1024:
+        block_m, block_n, num_warps, num_stages = 128, 64, 4, 3
     if out_layout not in ("zhsd", "zshd"):
         raise ValueError("out_layout must be 'zhsd' or 'zshd'")
     out_zshd = out_layout == "zshd"
@@ -1584,6 +1768,13 @@ def nvfp4_flash_attention(
         knv, ksc, ktnv, ktsc = _quant_nvfp4_dual(k2, s_kv_bwd_pad)
         vdnv, vdsc, vnv, vsc = _quant_nvfp4_dual(v2, s_kv_pad)
         packs = (qnv, qsc, qtnv, qtsc, knv, ksc, vdnv, vdsc, ktnv, ktsc)
+    elif s_q <= _FWD_FUSED_QUANT_MAX_SEQ and s_kv <= _FWD_FUSED_QUANT_MAX_SEQ:
+        # Single fused launch for Q/K/V pre-quant (folds 3 launches into 1). At
+        # short seqlen the per-launch overhead dominated; this is a win there and
+        # parity-identical to the three standalone _quant_nvfp4 calls. At long
+        # seqlen V's in-kernel key loop under-parallelizes vs three separate
+        # launches, so we keep the 3-launch path above that threshold.
+        qnv, qsc, knv, ksc, vnv, vsc = _quant_qkv_fwd(q2, k2, v2, s_kv_pad)
     else:
         qnv, qsc = _quant_nvfp4(q2)
         knv, ksc = _quant_nvfp4(k2)
