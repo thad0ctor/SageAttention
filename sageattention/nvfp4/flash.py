@@ -718,12 +718,17 @@ def _next_mult(n: int, m: int) -> int:
     return ((n + m - 1) // m) * m
 
 
-# Forward flash-tile defaults per head_dim, swept (parity-gated) on sm_120 across
-# S=2048/4096/8192. D=256 is SMEM-tight: BLOCK_M64/BLOCK_N128/warps8/stages3 already
-# wins (wider M-tiles or shallower pipelines spill or regress). D=128 has SMEM
-# headroom — a full BLOCK_M128/BLOCK_N128 tile with 2 pipeline stages is 1.5x (S2048)
-# to 2.0x (S8192) the D=256-style narrow default. (block_m, block_n, num_warps, num_stages).
-_FWD_TILE = {256: (64, 128, 8, 3), 128: (128, 128, 8, 2)}
+# Forward flash-tile defaults per head_dim. (block_m, block_n, num_warps, num_stages).
+# CORRECTNESS (sm_120): a tile dim equal to head_dim D makes an FP4 tl.dot_scaled
+# operand logically square (tile == contraction K), and Triton's block-scale axis
+# lowering mis-binds the scale -> garbage (cos ~0.2-0.6 vs SDPA). At D=128 that bans
+# block_m==128 and block_n==128. The prior (128,128,8,2) D=128 "perf" tile was that
+# exact broken case (throughput-swept, never correctness-gated). Separately the
+# save-packs training path is wrong with block_m=32. So D=128 needs block_m=64 and
+# block_n in {64,256}; (64,64,8,3) is the fastest correct end-to-end (fwd+bwd+save-
+# packs, validated loss 0.43). D=256 (64,128,8,3) is safe (128!=256). A faster D=128
+# needs an upstream Triton fix for square FP4 dot_scaled operands.
+_FWD_TILE = {256: (64, 128, 8, 3), 128: (64, 64, 8, 3)}
 _FWD_TILE_DEFAULT = (64, 128, 8, 3)
 
 # Below this seqlen the forward pre-quant is launch/overhead bound, so folding the
@@ -1736,12 +1741,17 @@ def nvfp4_flash_attention(
     block_m, block_n, num_warps, num_stages = _resolve_fwd_tiles(
         d, block_m, block_n, num_warps, num_stages
     )
-    # Short non-causal d=128: a narrower key tile with fewer warps + an extra
-    # pipeline stage (BLOCK_N=64, warps=4, stages=3) measured ~13% faster than the
-    # long-seq default (BLOCK_N=128, warps=8, stages=2) on sm_120 — at S<=1024 the
-    # wide tile under-fills. Only when the caller didn't override the tiles.
-    if (not user_tiles) and (not causal) and d == 128 and s_q <= 1024 and s_kv <= 1024:
-        block_m, block_n, num_warps, num_stages = 128, 64, 4, 3
+    # (Removed a short-non-causal d=128 perf special that forced block_m=128: at
+    # D=128 block_m==D makes the FP4 dot_scaled operand square -> wrong (cos ~0.31).
+    # Fall through to the validated (64,64); re-add a faster tile only behind a
+    # correctness gate and with block_m != D, block_n != D.)
+    # A tile dim equal to head_dim D corrupts the FP4 dot_scaled scale binding
+    # (square operand). Fail loud instead of silently returning garbage.
+    assert block_m != d and block_n != d, (
+        f"NVFP4 forward tile (block_m={block_m}, block_n={block_n}) has a dim equal "
+        f"to head_dim d={d}; this mis-binds the FP4 dot_scaled block-scale axis "
+        f"(square operand) and returns wrong results. Pick block_m/block_n != d."
+    )
     if out_layout not in ("zhsd", "zshd"):
         raise ValueError("out_layout must be 'zhsd' or 'zshd'")
     out_zshd = out_layout == "zshd"
@@ -2321,6 +2331,10 @@ def _run_bwd(
     # the extra overlap from a third stage.
     dq_block_m = block_m
     dq_block_n = 64 if d >= 256 else min(block_n, 128)
+    if dq_block_n == d:
+        # tile == head_dim makes the backward dP FP4 dot_scaled operand square,
+        # which mis-binds the block-scale axis -> corrupt dQ. Step off D.
+        dq_block_n = d // 2
     dq_warps = max(num_warps, 8)
     dq_stages = 3 if s_q >= 4096 else 2
 
