@@ -7,6 +7,18 @@ benchmarked as a real 5th-gen FP4 warp MMA (`MmaMXF4NVF4Op`, tile (16,8,64),
 kind::mxf4nvf4, e4m3 group-16 scale factors). Softmax + P@V are not yet wired (see
 "Remaining work").
 
+## Status update (FULL at-scale fused kernel landed — correct, A/B measured)
+The **full at-scale fused kernel** (`fp4_attention_fused_full.py`) now runs the
+WHOLE forward in ONE grid launch: multi-key-block flash accumulation (running
+m_i/l_i/acc in registers) + a grid over all z*h heads and query tiles. **Correct at
+scale** (cos vs SDPA(bf16) 0.9897–0.9899 across seq 1024–8192, bit-exact to the
+two-pass forward). **Decisive A/B (GPU-only CUDA-graph, z2 h16 d128): Triton wins
+3.2–6.6x** — the kernel is correct but its per-block serial scalar softmax +
+on-chip P requant (not the OMMA) dominates and scales with the key-block count. See
+"FULL at-scale fused kernel" below for the full correctness + A/B tables, the
+flash-loop/grid recipe, the resolved SF-swizzle blocker, and the precise perf
+remaining work.
+
 ## Status update (FUSED single kernel landed)
 The **fused single-kernel `O = softmax(scale·QK^T)@V` now LAUNCHES and is CORRECT**
 (`fp4_attention_fused_v2.py`): one CTA / one head / D=128, both GEMMs real
@@ -301,6 +313,83 @@ So the at-scale z2 h16 seq{1k..32k} head-to-head vs Triton (bars
 + multi-CTA scale-up (see "Remaining work"). The OMMA math + the on-chip P requant
 + the LDSM-free fill are all proven correct here; scaling out is mechanical (grid
 + key-block loop) and is the clear next step.
+
+## FULL at-scale fused kernel (`fp4_attention_fused_full.py`) — DONE + measured
+
+The scale-up landed: `fp4_attention_fused_full.py` extends the proven v2 single-tile
+fused kernel into a full kernel with (1) a **multi-key-block flash loop** (running
+m_i / l_i / acc in registers; per block: `S=QK^T` OMMA -> `m_new=max(m_i,rowmax)` ->
+`p=exp(S-m_new)` -> `alpha=exp(m_i-m_new)`, `l_i=l_i*alpha+rowsum(p)`,
+`acc=acc*alpha + requant(p)@V_block` OMMA -> `m_i=m_new`; epilogue `acc/=l_i`), and
+(2) a **grid over all work**: one CTA per (z*h head, query tile), grid
+`(Sq//128, z*h)`, `pid_zh` selects the head, `pid_m` the query tile; the Q tile is
+resident and K/V blocks stream from gmem. v2's per-block on-chip P requant + P@V are
+reused verbatim inside the loop. MHA non-causal, D=128, bf16 output `[z,h,Sq,D]`.
+
+**Correctness — cos vs torch SDPA(bf16), z2 h16 d128 (RTX PRO 6000 sm_120):**
+| seq   | cos vs SDPA | cos vs fp32 | max_abs  |
+|-------|------------:|------------:|---------:|
+| 1024  |     0.98974 |     0.98974 | 1.20e-02 |
+| 2048  |     0.98990 |     0.98991 | 8.94e-03 |
+| 4096  |     0.98985 |     0.98985 | 6.15e-03 |
+| 8192  |     0.98979 |     0.98979 | 4.75e-03 |
+
+All >= 0.97 target and bit-for-bit equal to the two-pass forward — the multi-block
+flash accumulation + the full grid are numerically exact. (1-head multi-block
+1024 = 0.98867; single-block 128 = 0.98897, identical to v2 — the loop is sound.)
+
+**THE DECISIVE A/B — GPU-only CUDA-graph ms, z2 h16 d128, fused CuTeDSL vs the
+fork's Triton `nvfp4_flash_attention`:**
+| seq  | CuTeDSL ms | Triton ms | ratio T/C | winner       |
+|------|-----------:|----------:|----------:|--------------|
+| 1024 |     0.3935 |    0.1239 |     0.315 | Triton 3.2x  |
+| 2048 |     1.1631 |    0.2306 |     0.198 | Triton 5.1x  |
+| 4096 |     4.5258 |    0.7255 |     0.160 | Triton 6.3x  |
+| 8192 |    16.7766 |    2.5495 |     0.152 | Triton 6.6x  |
+
+(Triton bars reproduce the published 0.148/0.238/0.738/2.50 targets.)
+
+**Honest read: Triton wins at every seq (3.2–6.6x), gap WIDENING with seq.** The
+kernel is correct at scale but NOT yet perf-competitive. The OMMA is not the
+problem — the **per-key-block serial softmax + on-chip P requant is**:
+- The softmax/requant assigns one query row to ONE thread (rows 0..127 on threads
+  0..127; threads 128..255 idle), then does scalar `exp`, group amax, e2m1 packing,
+  and an SMEM round-trip of P **per key block**. CuTeDSL ms scales ~linearly with
+  `nblk` (4.5 ms @ 32 blocks -> 16.8 ms @ 64 blocks ≈ 2x for 2x blocks), i.e. the
+  per-block softmax/requant dominates and the OMMA is hidden under it.
+- No SMEM double-buffering of K/V: each block's gmem->smem load + the requant
+  SMEM round-trips are fully serialized between the two OMMAs (5+ `sync_threads`
+  per block).
+- Triton's `tl.dot_scaled` flash fuses the softmax into vectorized warp-wide ops
+  across all 8 warps and pipelines K/V loads (num_stages=3) — both of which this
+  prototype's scalar single-warp-group softmax path lacks.
+
+This is the OPPOSITE of the QK-only sub-step (where the bare OMMA beat Triton 1.8x
+at seq>=4096): once the full flash glue (softmax + on-chip requant, the genuinely
+serial part) is on the critical path every block, it swamps the OMMA win.
+
+**Remaining work to make it competitive (not blockers — the kernel is correct):**
+1. Vectorize the softmax/requant across all 256 threads (2 threads/row warp-shuffle
+   reduce instead of 1 thread/row with 128 idle), eliminating the dominant cost.
+2. Double-buffer K/V in SMEM (cp.async, 2–3 stages) to overlap the next block's
+   load with the current block's OMMA + requant.
+3. Fewer SMEM round-trips for P: the requant currently stages P to plain SMEM then
+   re-copies into the swizzled operand-A SMEM; fusing these halves the P traffic.
+4. Tune BLOCK_M / BLOCK_N / warp count. Causal + GQA are stretch goals (the grid
+   already maps `pid_zh -> head`; GQA needs only a `head//groups` K/V index, causal
+   needs an early `j` cutoff — neither is wired).
+
+**Run:**
+```
+# correctness (slow host operand build at large seq):
+PYTHONPATH=reference:.:attn CUDA_VISIBLE_DEVICES=1 ATT_Z=2 ATT_H=16 \
+  ATT_SEQS=1024,2048,4096,8192 ATT_BENCH=0 \
+  <venv python> run_example_45native.py attn/fp4_attention_fused_full.py
+# decisive A/B vs Triton (needs the fork repo on PYTHONPATH for sageattention.nvfp4):
+PYTHONPATH=reference:.:attn:<fork-repo> CUDA_VISIBLE_DEVICES=1 ATT_Z=2 ATT_H=16 \
+  ATT_CORR=0 ATT_BENCH=1 ATT_BENCH_SEQS=1024,2048,4096,8192 \
+  <venv python> run_example_45native.py attn/fp4_attention_fused_full.py
+```
 
 ## Remaining work to a full flash forward
 0. **DONE (two-pass):** the full forward is wired and validated (above). What
