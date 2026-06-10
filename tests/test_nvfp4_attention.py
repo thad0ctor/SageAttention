@@ -159,8 +159,14 @@ def test_forward_zshd_layout_matches_default():
     assert torch.equal(out_zshd, out.transpose(1, 2).contiguous())
 
 
-@pytest.mark.parametrize("bf16_grad_dots", [True, False])
-def test_backward_sanity(bf16_grad_dots):
+@pytest.mark.parametrize(
+    "bf16_grad_dots,ds_cache",
+    [(True, None), (True, "1"), (True, "0"), (False, None)],
+)
+def test_backward_sanity(bf16_grad_dots, ds_cache, monkeypatch):
+    if ds_cache is not None:
+        # exercise both hp dQ flavors: dS-cache GEMM and full recompute
+        monkeypatch.setenv("NVFP4_DS_CACHE", ds_cache)
     torch.manual_seed(0)
     z, h, hk, s, d = 1, 4, 4, 128, 128
     scaling = 1.0 / math.sqrt(d)

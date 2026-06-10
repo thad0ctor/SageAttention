@@ -1512,6 +1512,7 @@ def _flash_bwd_dkdv_hp_kernel(
     delta_ptr,
     dk_ptr,
     dv_ptr,
+    dst_ptr,
     scaling,
     Sq,
     Skv,
@@ -1531,6 +1532,7 @@ def _flash_bwd_dkdv_hp_kernel(
     DO_ZSHD: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     CAUSAL: tl.constexpr,
+    STORE_DS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
@@ -1637,6 +1639,22 @@ def _flash_bwd_dkdv_hp_kernel(
             dpT = tl.dot(v_t, tl.trans(do_t))
             dsT = pT * (dpT - delta[None, :]) * scaling
             dsT = tl.where(pT == 0.0, 0.0, dsT)
+
+            if STORE_DS:
+                # Cache dS^T (bf16) so the dQ pass degenerates to dQ = dS @ K
+                # with no S/dP recompute. Fully causal-masked tiles are never
+                # visited here, so the plane is left uninitialized there; the
+                # dS-cache dQ kernel re-applies the causal mask on load (a
+                # compare+select, no exp/LSE), which also covers any tile-grid
+                # mismatch between the two kernels.
+                tl.store(
+                    dst_ptr
+                    + zh * (Skv * Sq)
+                    + offs_n[:, None] * Sq
+                    + offs_m[None, :],
+                    dsT.to(dst_ptr.dtype.element_ty),
+                    mask=nmask[:, None] & mmask[None, :],
+                )
 
             q_t = tl.load(
                 q_ptr + zh * (Sq * sq_n) + offs_m[:, None] * sq_n + offs_d[None, :],
@@ -1789,6 +1807,72 @@ def _flash_bwd_dq_hp_kernel(
         )
         # dQ += dS @ K  (exact dS, bf16 MMA)
         dq = tl.dot(ds.to(k_t.dtype), k_t, acc=dq)
+
+    tl.store(
+        dq_ptr + pid_zh * (Sq * sdq_n) + offs_m[:, None] * sdq_n + offs_d[None, :],
+        dq.to(dq_ptr.dtype.element_ty),
+        mask=mmask[:, None],
+    )
+
+
+# ---------------------------------------------------------------------------
+# HP-grad-dots backward, dS-cache dQ pass. One program per (z, h, query-block
+# m). With dS^T cached by the dK/dV pass, this is a pure bf16 GEMM
+# dQ[m,:] += dS[m,n] @ K[n,:] — no S/dP recompute, no exp, no FP4 packs, no
+# lse/delta. Removes the duplicated recompute that made the split backward
+# ~7/5 the MMA work of a fused one. The causal mask is re-applied on the
+# cached tile (compare+select) so unvisited plane regions are never consumed.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _flash_bwd_dq_dscache_kernel(
+    dst_ptr,
+    k_ptr,
+    dq_ptr,
+    Sq,
+    Skv,
+    sk_n,
+    sdq_n,
+    D: tl.constexpr,
+    H: tl.constexpr,
+    HK: tl.constexpr,
+    CAUSAL: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_zh = tl.program_id(1)
+    z = pid_zh // H
+    h = pid_zh % H
+    zhk = z * HK + (h // (H // HK))
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, D)
+    mmask = offs_m < Sq
+
+    dq = tl.zeros((BLOCK_M, D), dtype=tl.float32)
+    if CAUSAL:
+        hi = tl.minimum(Skv, (pid_m * BLOCK_M + BLOCK_M) + (Skv - Sq))
+    else:
+        hi = Skv
+
+    for start_n in range(0, hi, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        nmask = offs_n < Skv
+        # cached dS^T plane is [Z*H, Skv, Sq]; read the [m, n] tile transposed
+        ds = tl.load(
+            dst_ptr + pid_zh * (Skv * Sq) + offs_n[None, :] * Sq + offs_m[:, None],
+            mask=mmask[:, None] & nmask[None, :],
+            other=0.0,
+        )
+        if CAUSAL:
+            causal_ok = offs_n[None, :] <= (offs_m[:, None] + (Skv - Sq))
+            ds = tl.where(causal_ok, ds, 0.0)
+        k_t = tl.load(
+            k_ptr + zhk * (Skv * sk_n) + offs_n[:, None] * sk_n + offs_d[None, :],
+            mask=nmask[:, None],
+            other=0.0,
+        )
+        dq = tl.dot(ds, k_t, acc=dq)
 
     tl.store(
         dq_ptr + pid_zh * (Sq * sdq_n) + offs_m[:, None] * sdq_n + offs_d[None, :],
@@ -2651,6 +2735,39 @@ def _run_bwd_hp(
         dq_warps = int(_e.get("NVFP4_DQ_W", dq_warps))
         dq_stages = int(_e.get("NVFP4_DQ_S", dq_stages))
 
+    # dS-cache fast dQ: the dK/dV pass writes its dS^T tiles (bf16) and the dQ
+    # pass becomes a pure dS @ K GEMM — no second S/dP recompute (the split
+    # backward's structural ~7/5-MMA handicap vs a fused kernel). Worth the
+    # plane bandwidth only while the [Z*H, Skv, Sq] plane is small, i.e. the
+    # short-seq regime — which is exactly where the recompute overhead, not
+    # the MMA throughput, dominates the gap vs cuDNN/flash.
+    # The recompute saved per cached element is two D-contractions (~2*D MACs)
+    # against a fixed ~4B/elem of plane bandwidth, so the economics scale with
+    # D: d=256 wins broadly (measured +0.15-0.2x vs SDPA up to 4k), d=128 only
+    # while the plane is small (h32 s2048 = 268MB already regresses).
+    ds_bytes = z * h * s_kv * s_q * 2
+    if d >= 256:
+        ds_cache = s_kv <= 4096 and ds_bytes <= 1024 * 2**20
+    else:
+        ds_cache = ds_bytes <= 128 * 2**20
+    _env_ds = os.environ.get("NVFP4_DS_CACHE")
+    if _env_ds is not None:
+        ds_cache = _env_ds == "1"
+    if ds_cache:
+        if d <= 128:
+            dqc_block_m, dqc_block_n, dqc_warps, dqc_stages = 128, 64, 8, 3
+        else:
+            dqc_block_m, dqc_block_n, dqc_warps, dqc_stages = 64, 64, 8, 3
+        if os.environ.get("NVFP4_BWD_TILE_OVERRIDE"):
+            _e = os.environ
+            dqc_block_m = int(_e.get("NVFP4_DQC_BM", dqc_block_m))
+            dqc_block_n = int(_e.get("NVFP4_DQC_BN", dqc_block_n))
+            dqc_warps = int(_e.get("NVFP4_DQC_W", dqc_warps))
+            dqc_stages = int(_e.get("NVFP4_DQC_S", dqc_stages))
+        dst_p = torch.empty(z * h, s_kv, s_q, device=q.device, dtype=k.dtype)
+    else:
+        dst_p = q  # unused dummy pointer (STORE_DS=False)
+
     bdummy = bias if bias is not None else q
     sb_z = bias.stride(0) if bias is not None else 0
     has_bias = bias is not None
@@ -2757,6 +2874,7 @@ def _run_bwd_hp(
         delta,
         dk,
         dv,
+        dst_p,
         scaling,
         s_q,
         s_kv,
@@ -2776,45 +2894,65 @@ def _run_bwd_hp(
         DO_ZSHD=do_zshd,
         HAS_BIAS=has_bias,
         CAUSAL=causal,
+        STORE_DS=ds_cache,
         BLOCK_M=dkdv_block_m,
         BLOCK_N=dkdv_block_n,
         num_warps=dkdv_warps,
         num_stages=dkdv_stages,
     )
-    _flash_bwd_dq_hp_kernel[(triton.cdiv(s_q, dq_block_m), z * h)](
-        qnv_p,
-        qsc_p.view(torch.uint8),
-        do,
-        k,
-        v,
-        knv_p,
-        ksc_pv,
-        bdummy,
-        lse,
-        delta,
-        dq,
-        scaling,
-        s_q,
-        s_kv,
-        sk_n=k.stride(1),
-        sv_n=v.stride(1),
-        sdo_z=sdo_z,
-        sdo_h=sdo_h,
-        sdo_m=sdo_m,
-        sdo_n=sdo_n,
-        sb_z=sb_z,
-        sdq_n=dq.stride(1),
-        D=d,
-        H=h,
-        HK=hk,
-        DO_ZSHD=do_zshd,
-        HAS_BIAS=has_bias,
-        CAUSAL=causal,
-        BLOCK_M=dq_block_m,
-        BLOCK_N=dq_block_n,
-        num_warps=dq_warps,
-        num_stages=dq_stages,
-    )
+    if ds_cache:
+        _flash_bwd_dq_dscache_kernel[(triton.cdiv(s_q, dqc_block_m), z * h)](
+            dst_p,
+            k,
+            dq,
+            s_q,
+            s_kv,
+            sk_n=k.stride(1),
+            sdq_n=dq.stride(1),
+            D=d,
+            H=h,
+            HK=hk,
+            CAUSAL=causal,
+            BLOCK_M=dqc_block_m,
+            BLOCK_N=dqc_block_n,
+            num_warps=dqc_warps,
+            num_stages=dqc_stages,
+        )
+    else:
+        _flash_bwd_dq_hp_kernel[(triton.cdiv(s_q, dq_block_m), z * h)](
+            qnv_p,
+            qsc_p.view(torch.uint8),
+            do,
+            k,
+            v,
+            knv_p,
+            ksc_pv,
+            bdummy,
+            lse,
+            delta,
+            dq,
+            scaling,
+            s_q,
+            s_kv,
+            sk_n=k.stride(1),
+            sv_n=v.stride(1),
+            sdo_z=sdo_z,
+            sdo_h=sdo_h,
+            sdo_m=sdo_m,
+            sdo_n=sdo_n,
+            sb_z=sb_z,
+            sdq_n=dq.stride(1),
+            D=d,
+            H=h,
+            HK=hk,
+            DO_ZSHD=do_zshd,
+            HAS_BIAS=has_bias,
+            CAUSAL=causal,
+            BLOCK_M=dq_block_m,
+            BLOCK_N=dq_block_n,
+            num_warps=dq_warps,
+            num_stages=dq_stages,
+        )
     return dq, dk, dv
 
 
