@@ -159,7 +159,8 @@ def test_forward_zshd_layout_matches_default():
     assert torch.equal(out_zshd, out.transpose(1, 2).contiguous())
 
 
-def test_backward_sanity():
+@pytest.mark.parametrize("bf16_grad_dots", [True, False])
+def test_backward_sanity(bf16_grad_dots):
     torch.manual_seed(0)
     z, h, hk, s, d = 1, 4, 4, 128, 128
     scaling = 1.0 / math.sqrt(d)
@@ -180,10 +181,13 @@ def test_backward_sanity():
     # With stochastic_rounding=True the per-element grads are unbiased but noisy,
     # so a single SR sample has low cos-sim by design (it averages to the
     # reference over steps — the convergence knob, not a per-step parity target).
+    # bf16_grad_dots=True is the default hp path; False covers the legacy
+    # all-FP4 backward (the save_backward_packs path).
     try:
         out = nvfp4_flash_attn_func(
             qf, kf, vf, scaling, causal=True, num_key_value_groups=1,
             stochastic_rounding=False,
+            backward_bf16_grad_dots=bf16_grad_dots,
         )
     except Exception as exc:  # noqa: BLE001
         _skip_if_unsupported(exc)
