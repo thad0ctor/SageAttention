@@ -1506,6 +1506,7 @@ def _flash_bwd_dkdv_hp_kernel(
     qsc_ptr,
     knv_ptr,
     ksc_ptr,
+    k_ptr,
     v_ptr,
     bias_ptr,
     lse_ptr,
@@ -1513,10 +1514,12 @@ def _flash_bwd_dkdv_hp_kernel(
     dk_ptr,
     dv_ptr,
     dst_ptr,
+    dqa_ptr,
     scaling,
     Sq,
     Skv,
     sq_n,
+    sk_n,
     sv_n,
     sdo_z,
     sdo_h,
@@ -1533,6 +1536,7 @@ def _flash_bwd_dkdv_hp_kernel(
     HAS_BIAS: tl.constexpr,
     CAUSAL: tl.constexpr,
     STORE_DS: tl.constexpr,
+    ATOMIC_DQ: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
@@ -1567,6 +1571,13 @@ def _flash_bwd_dkdv_hp_kernel(
         mask=nmask[:, None],
         other=0.0,
     )
+    if ATOMIC_DQ:
+        # hp K resident: the dQ contribution dS @ K reuses it every m-iter.
+        k_t = tl.load(
+            k_ptr + zhk * (Skv * sk_n) + offs_n[:, None] * sk_n + offs_d[None, :],
+            mask=nmask[:, None],
+            other=0.0,
+        )
 
     if HAS_BIAS:
         b = tl.load(bias_ptr + z * sb_z + offs_n, mask=nmask, other=_NEG_INF)
@@ -1663,6 +1674,24 @@ def _flash_bwd_dkdv_hp_kernel(
             )
             # dK += dSt @ Q  (exact dSt, bf16 MMA)
             dk = tl.dot(dsT.to(q_t.dtype), q_t, acc=dk)
+
+            if ATOMIC_DQ:
+                # Single-kernel fused backward: this program's dQ contribution
+                # dQ[m,:] += dS[m,n-block] @ K[n-block,:] accumulates into an
+                # fp32 plane with red.global.add — same scheme (and the same
+                # 5-MMA count and run-to-run accumulation-order nondeterminism)
+                # as FlashAttention-2's fused backward. K is resident, so this
+                # adds one bf16 dot and the atomic traffic, and the separate
+                # dQ pass (with its second S/dP recompute) disappears.
+                dq_c = tl.dot(tl.trans(dsT).to(k_t.dtype), k_t)
+                tl.atomic_add(
+                    dqa_ptr
+                    + zh * (Sq * D)
+                    + offs_m[:, None] * D
+                    + offs_d[None, :],
+                    dq_c,
+                    mask=mmask[:, None],
+                )
 
     tl.store(
         dk_ptr + pid_zg * (Skv * sdk_n) + offs_n[:, None] * sdk_n + offs_d[None, :],
@@ -2701,7 +2730,6 @@ def _run_bwd_hp(
     ng = h // hk
 
     delta = torch.empty(z * h, s_q, device=q.device, dtype=torch.float32)
-    dq = torch.empty(z * h, s_q, d, device=q.device, dtype=out_dtype)
     dk = torch.empty(z * hk, s_kv, d, device=q.device, dtype=out_dtype)
     dv = torch.empty(z * hk, s_kv, d, device=q.device, dtype=out_dtype)
 
@@ -2735,25 +2763,44 @@ def _run_bwd_hp(
         dq_warps = int(_e.get("NVFP4_DQ_W", dq_warps))
         dq_stages = int(_e.get("NVFP4_DQ_S", dq_stages))
 
-    # dS-cache fast dQ: the dK/dV pass writes its dS^T tiles (bf16) and the dQ
-    # pass becomes a pure dS @ K GEMM — no second S/dP recompute (the split
-    # backward's structural ~7/5-MMA handicap vs a fused kernel). Worth the
-    # plane bandwidth only while the [Z*H, Skv, Sq] plane is small, i.e. the
-    # short-seq regime — which is exactly where the recompute overhead, not
-    # the MMA throughput, dominates the gap vs cuDNN/flash.
-    # The recompute saved per cached element is two D-contractions (~2*D MACs)
-    # against a fixed ~4B/elem of plane bandwidth, so the economics scale with
-    # D: d=256 wins broadly (measured +0.15-0.2x vs SDPA up to 4k), d=128 only
-    # while the plane is small (h32 s2048 = 268MB already regresses).
+    # dQ strategy — all three avoid grad-operand quantization; they differ in
+    # how the second S/dP recompute (the split backward's structural ~7/5-MMA
+    # handicap vs a fused kernel) is eliminated:
+    #   "dscache":   the dK/dV pass streams exact dS^T tiles (k.dtype) to a
+    #                [Z*H, Skv, Sq] plane; the dQ pass is a pure dS @ K GEMM.
+    #                Deterministic. Graph-replay measured (RTX PRO 6000): the
+    #                FASTEST mode nearly everywhere — d256 1.00/1.00/1.26/1.19x
+    #                vs SDPA @1k-8k b1, b4 s2048 1.42x, d128 4k 1.11x — so the
+    #                gate is a transient-MEMORY cap, not a speed heuristic.
+    #                Only d128 s2048 (h32) loses ~5% to recompute.
+    #   "recompute": independent dQ pass redoing the FP4 S + bf16 dP dots.
+    #                Deterministic, no scratch plane; the fallback when the
+    #                plane would be too large.
+    #   "fused":     single-kernel backward, dQ accumulated into an fp32 plane
+    #                via tl.atomic_add (K resident, one extra bf16 dot; 5 MMAs
+    #                like FlashAttention-2's fused backward). MEASURED NO-GO on
+    #                sm_120/Triton 3.7 — red.global.add contention serializes
+    #                it to 0.25-0.65x — kept env-selectable for future stacks,
+    #                never auto-selected. Nondeterministic accumulation order.
     ds_bytes = z * h * s_kv * s_q * 2
+    ds_cap = int(os.environ.get("NVFP4_DS_CACHE_MAX_MB", "1536")) * 2**20
     if d >= 256:
-        ds_cache = s_kv <= 4096 and ds_bytes <= 1024 * 2**20
+        dq_mode = "dscache" if ds_bytes <= ds_cap else "recompute"
+    elif ds_bytes <= 128 * 2**20 or (s_kv >= 4096 and ds_bytes <= ds_cap):
+        dq_mode = "dscache"
     else:
-        ds_cache = ds_bytes <= 128 * 2**20
-    _env_ds = os.environ.get("NVFP4_DS_CACHE")
+        dq_mode = "recompute"
+    _env_ds = os.environ.get("NVFP4_DS_CACHE")  # legacy toggle (tests)
     if _env_ds is not None:
-        ds_cache = _env_ds == "1"
-    if ds_cache:
+        dq_mode = "dscache" if _env_ds == "1" else "recompute"
+    _env_mode = os.environ.get("NVFP4_BWD_DQ_MODE")
+    if _env_mode in ("fused", "dscache", "recompute"):
+        dq_mode = _env_mode
+    if dq_mode == "fused" and d >= 256:
+        # the resident hp K tile + dQ-contribution staging don't fit a third
+        # pipeline stage in the 99KB budget at D=256
+        dkdv_stages = min(dkdv_stages, 2)
+    if dq_mode == "dscache":
         if d <= 128:
             dqc_block_m, dqc_block_n, dqc_warps, dqc_stages = 128, 64, 8, 3
         else:
@@ -2767,6 +2814,11 @@ def _run_bwd_hp(
         dst_p = torch.empty(z * h, s_kv, s_q, device=q.device, dtype=k.dtype)
     else:
         dst_p = q  # unused dummy pointer (STORE_DS=False)
+    if dq_mode == "fused":
+        # zero-init: rows whose causal tiles are all masked must stay 0
+        dqa_p = torch.zeros(z * h, s_q, d, device=q.device, dtype=torch.float32)
+    else:
+        dqa_p = q  # unused dummy pointer (ATOMIC_DQ=False)
 
     bdummy = bias if bias is not None else q
     sb_z = bias.stride(0) if bias is not None else 0
@@ -2868,6 +2920,7 @@ def _run_bwd_hp(
         qsc_p.view(torch.uint8),
         knv_p,
         ksc_pv,
+        k,
         v,
         bdummy,
         lse,
@@ -2875,10 +2928,12 @@ def _run_bwd_hp(
         dk,
         dv,
         dst_p,
+        dqa_p,
         scaling,
         s_q,
         s_kv,
         sq_n=q.stride(1),
+        sk_n=k.stride(1),
         sv_n=v.stride(1),
         sdo_z=sdo_z,
         sdo_h=sdo_h,
@@ -2894,13 +2949,17 @@ def _run_bwd_hp(
         DO_ZSHD=do_zshd,
         HAS_BIAS=has_bias,
         CAUSAL=causal,
-        STORE_DS=ds_cache,
+        STORE_DS=dq_mode == "dscache",
+        ATOMIC_DQ=dq_mode == "fused",
         BLOCK_M=dkdv_block_m,
         BLOCK_N=dkdv_block_n,
         num_warps=dkdv_warps,
         num_stages=dkdv_stages,
     )
-    if ds_cache:
+    if dq_mode == "fused":
+        return dqa_p.to(out_dtype), dk, dv
+    dq = torch.empty(z * h, s_q, d, device=q.device, dtype=out_dtype)
+    if dq_mode == "dscache":
         _flash_bwd_dq_dscache_kernel[(triton.cdiv(s_q, dqc_block_m), z * h)](
             dst_p,
             k,

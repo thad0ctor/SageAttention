@@ -160,13 +160,20 @@ def test_forward_zshd_layout_matches_default():
 
 
 @pytest.mark.parametrize(
-    "bf16_grad_dots,ds_cache",
-    [(True, None), (True, "1"), (True, "0"), (False, None)],
+    "bf16_grad_dots,dq_mode",
+    [
+        (True, None),
+        (True, "dscache"),
+        (True, "recompute"),
+        (True, "fused"),
+        (False, None),
+    ],
 )
-def test_backward_sanity(bf16_grad_dots, ds_cache, monkeypatch):
-    if ds_cache is not None:
-        # exercise both hp dQ flavors: dS-cache GEMM and full recompute
-        monkeypatch.setenv("NVFP4_DS_CACHE", ds_cache)
+def test_backward_sanity(bf16_grad_dots, dq_mode, monkeypatch):
+    if dq_mode is not None:
+        # exercise all hp dQ flavors: dS-cache GEMM, full recompute, and the
+        # single-kernel atomic-dQ variant (env-only; auto never selects it)
+        monkeypatch.setenv("NVFP4_BWD_DQ_MODE", dq_mode)
     torch.manual_seed(0)
     z, h, hk, s, d = 1, 4, 4, 128, 128
     scaling = 1.0 / math.sqrt(d)
