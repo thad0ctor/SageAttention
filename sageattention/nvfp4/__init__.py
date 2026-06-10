@@ -13,6 +13,7 @@ from .flash import (
     _quant_nvfp4_dual,
     _resolve_fwd_tiles,
     _run_bwd,
+    _run_bwd_hp,
     _run_flash_packed,
     nvfp4_flash_attention,
     nvfp4_flash_attention_packed,
