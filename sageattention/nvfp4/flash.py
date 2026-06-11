@@ -2129,6 +2129,7 @@ def _run_flash_packed(
     num_warps,
     num_stages,
     out_zshd=False,
+    varlen_arrays=None,
 ):
     """Launch the flash kernel on already-packed (tl.dot_scaled layout) Q/K/V.
 
@@ -2139,6 +2140,10 @@ def _run_flash_packed(
     ``out_zshd``: ``out`` is laid out ``[Z, Sq, H, D]`` and the kernel stores that
     layout directly (the Sq-axis row stride is ``out.stride(1)`` either way; the z/head
     strides come from the 4-D tensor). Default ``out`` is ``[Z*H, Sq, D]``.
+
+    ``varlen_arrays``: optional ``(seq_id, seq_start, seq_end)`` from
+    ``_varlen_seq_arrays`` — runs the kernel in VARLEN (block-diagonal causal)
+    mode, exactly like the in-kernel-quant ``nvfp4_flash_attention`` varlen path.
     """
     qnv_v = qnv.view(torch.uint8)
     knv_v = knv.view(torch.uint8)
@@ -2146,6 +2151,11 @@ def _run_flash_packed(
     qsc_v = qsc.view(torch.uint8)
     ksc_v = ksc.view(torch.uint8)
     vsc_v = vsc.view(torch.uint8)
+
+    varlen = varlen_arrays is not None
+    seq_id, seq_start = (
+        (varlen_arrays[0], varlen_arrays[1]) if varlen else (qnv_v, qnv_v)
+    )
 
     grid = (triton.cdiv(s_q, block_m), z * h)
     _flash_fwd_kernel[grid](
@@ -2156,8 +2166,8 @@ def _run_flash_packed(
         vnv_v,
         vsc_v,
         bias if bias is not None else qnv_v,
-        qnv_v,  # dummy seqid ptr (VARLEN=False)
-        qnv_v,  # dummy seqstart ptr (VARLEN=False)
+        seq_id,  # dummy ptr when not varlen
+        seq_start,
         out,
         out,  # dummy lse ptr (STORE_LSE=False)
         scaling,
@@ -2178,7 +2188,7 @@ def _run_flash_packed(
         so_h=out.stride(2) if out_zshd else 0,
         HAS_BIAS=bias is not None,
         CAUSAL=causal,
-        VARLEN=False,
+        VARLEN=varlen,
         STORE_LSE=False,
         OUT_ZSHD=out_zshd,
         BLOCK_M=block_m,
@@ -2209,11 +2219,13 @@ def nvfp4_flash_attention_packed(
     out_dtype: torch.dtype,
     causal: bool = False,
     key_pad_bias: torch.Tensor | None = None,
+    cu_seqlens: torch.Tensor | None = None,
     block_m: int = 64,
     block_n: int = 128,
     num_warps: int = 8,
     num_stages: int = 3,
     out_layout: str = "zhsd",
+    _varlen_arrays: tuple | None = None,
 ) -> torch.Tensor:
     """Flash forward on Q/K/V ALREADY in the NVFP4 tl.dot_scaled layout.
 
@@ -2221,6 +2233,15 @@ def nvfp4_flash_attention_packed(
     from the fused producers (RoPE for Q/K, v_proj epilogue / key-axis quant for V).
     V's key axis must be padded to a multiple of ``block_n`` (padded keys contribute
     nothing: masked to -inf and eps-scaled zero columns).
+
+    ``cu_seqlens``: optional int ``[nseq+1]`` cumulative sample boundaries
+    (FA-varlen convention) for PACKED sequences flattened into one row — the same
+    block-diagonal causal varlen mode as ``nvfp4_flash_attention``. Requires
+    ``causal=True``, ``z == 1`` and ``s_q == s_kv``. The packed operands need no
+    varlen awareness (Q/K quant is per-token along D; V's key-axis groups match
+    the in-kernel quant layout exactly), only the attention loops do.
+    ``_varlen_arrays``: precomputed ``_varlen_seq_arrays`` output (skips the
+    cu_seqlens host validation when the caller already expanded them).
 
     ``out_layout``:
       * ``"zhsd"`` (default): returns ``[Z, H, Sq, D]``.
@@ -2231,6 +2252,20 @@ def nvfp4_flash_attention_packed(
     bias = None
     if key_pad_bias is not None:
         bias = key_pad_bias.to(torch.float32).contiguous()
+    varlen_arrays = _varlen_arrays
+    if cu_seqlens is not None or varlen_arrays is not None:
+        assert causal, (
+            "varlen (cu_seqlens) implements block-diagonal CAUSAL attention; "
+            "pass causal=True"
+        )
+        assert z == 1, (
+            f"varlen packs all samples into one flattened row: Z must be 1, got Z={z}"
+        )
+        assert s_q == s_kv, (
+            f"varlen requires packed self-attention (Sq == Skv), got {s_q} vs {s_kv}"
+        )
+        if varlen_arrays is None:
+            varlen_arrays = _varlen_seq_arrays(cu_seqlens, s_q, qnv.device)
     block_m, block_n, num_warps, num_stages = _resolve_fwd_tiles(
         d, block_m, block_n, num_warps, num_stages
     )
@@ -2261,6 +2296,7 @@ def nvfp4_flash_attention_packed(
         num_warps,
         num_stages,
         out_zshd=out_zshd,
+        varlen_arrays=varlen_arrays,
     )
     if out_zshd:
         return out

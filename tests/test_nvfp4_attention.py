@@ -411,6 +411,69 @@ def test_varlen_single_sample_matches_dense():
     assert torch.equal(out_fwd, out_dense)
 
 
+@pytest.mark.parametrize("d", [128, 256])
+def test_varlen_packed_operands_match_in_kernel_quant(d):
+    """``nvfp4_flash_attention_packed(..., cu_seqlens=...)`` — pre-packed operands
+    (fused-producer layout) through the VARLEN kernel — is bit-identical to the
+    in-kernel-quant varlen forward: same deterministic ``_quant_nvfp4`` packs,
+    same kernel, only the quant happens outside."""
+    from sageattention.nvfp4 import _quant_nvfp4, nvfp4_flash_attention_packed
+    from sageattention.nvfp4.flash import (
+        _FWD_TILE_DEFAULT,
+        _next_mult,
+        _resolve_fwd_tiles,
+    )
+
+    torch.manual_seed(11 + d)
+    # sum > _FWD_FUSED_QUANT_MAX_SEQ so the reference path uses the standalone
+    # _quant_nvfp4 launches (bit-identical to the pre-packed operands here).
+    lens = [800, 1500, 400, 500]
+    s = sum(lens)
+    z, h, hk = 1, 4, 2
+    groups = h // hk
+    scaling = 1.0 / math.sqrt(d)
+    cu = _varlen_cu(lens)
+
+    q = torch.randn(z, h, s, d, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(z, hk, s, d, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(z, hk, s, d, device="cuda", dtype=torch.bfloat16)
+
+    block_n = _resolve_fwd_tiles(d, *_FWD_TILE_DEFAULT)[1]
+    s_pad = _next_mult(s, block_n)
+    qnv, qsc = _quant_nvfp4(q.reshape(z * h, s, d))
+    knv, ksc = _quant_nvfp4(k.reshape(z * hk, s, d))
+    vnv, vsc = _quant_nvfp4(v.reshape(z * hk, s, d), transpose=True, k_pad=s_pad)
+
+    common = dict(
+        z=z, h=h, hk=hk, s_q=s, s_kv=s, d=d, scaling=scaling,
+        out_dtype=q.dtype, causal=True,
+    )
+    try:
+        out_packed = nvfp4_flash_attention_packed(
+            qnv, qsc, knv, ksc, vnv, vsc, cu_seqlens=cu, **common
+        )
+        out_ref = nvfp4_flash_attention(
+            q, k, v, scaling, causal=True, num_key_value_groups=groups,
+            cu_seqlens=cu,
+        )
+    except Exception as exc:  # noqa: BLE001
+        _skip_if_unsupported(exc)
+    assert torch.equal(out_packed, out_ref)
+
+    # zshd layout: bit-identical to zhsd then transpose.
+    out_zshd = nvfp4_flash_attention_packed(
+        qnv, qsc, knv, ksc, vnv, vsc, cu_seqlens=cu, out_layout="zshd", **common
+    )
+    assert torch.equal(out_zshd, out_packed.transpose(1, 2))
+
+    # varlen knob rejections mirror nvfp4_flash_attention.
+    with pytest.raises(AssertionError, match="causal"):
+        nvfp4_flash_attention_packed(
+            qnv, qsc, knv, ksc, vnv, vsc, cu_seqlens=cu,
+            **{**common, "causal": False},
+        )
+
+
 def test_varlen_rejects_bad_args():
     torch.manual_seed(0)
     z, h, s, d = 1, 4, 256, 128
