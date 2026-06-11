@@ -56,7 +56,7 @@ S=2048 and ~1.3x slower at S=4096. Validated on Qwen3.5-2B: a 120-step SR-on
 training run tracks bf16 attention to within loss noise (no divergence).
 
 The DEFAULT training backward is now the HP-GRAD-DOTS variant (``_run_bwd_hp``,
-``backward_bf16_grad_dots``): S/dP recomputes keep FP4 ``tl.dot_scaled`` (packs
+``backward_grad_dots="bf16"``): S/dP recomputes keep FP4 ``tl.dot_scaled`` (packs
 prepacked once, consistent with the forward LSE), while the three grad GEMMs
 (dV, dK, dQ) run as bf16 ``tl.dot`` with EXACT pT/dS operands — no per-iter
 quant/SR ALU in the hot loops, no transposed or V packs in HBM, GQA dK/dV
@@ -66,6 +66,40 @@ Measured (RTX PRO 6000, b1 h32 hk8 d128 causal vs bf16 cuDNN SDPA): backward
 (vs 0.94 RTN / 0.82 single-shot SR), backward scratch memory ~4x smaller.
 The all-FP4 backward remains for ``save_backward_packs=True`` (which it
 requires) and as an explicit opt-out.
+
+BACKWARD GRAD-DOT MODES (``backward_grad_dots`` on ``nvfp4_flash_attn_func``):
+  * "bf16"        — the hp backward above (exact grad operands).
+  * "fp4_rownorm" — all-FP4 grad GEMMs with per-row RMS-normalized gradient
+    operand packs (``_pack_nvfp4_along_k_rn``): each grad tile's rows are
+    divided by their RMS before the NVFP4 pack and the factor is multiplied
+    back onto the dot_scaled OUTPUT rows. The packed VALUES are unchanged (the
+    per-group amax scale absorbs any row factor exactly); the entire effect is
+    keeping the STORED e4m3 scale mid-range so arbitrarily small gradient
+    tiles never underflow it. Measured (RTX PRO 6000): memorization matches
+    the hp backward (0.233 vs 0.236), grad cos 0.97-0.98, backward 1.12x hp /
+    1.10x FA2 at s8192 d256.
+  * "fp8_rownorm" — accuracy-leaning variant: the gradient-side GEMM operands
+    (pT/dSt/dS and the stationary Q^T/K^T/dO^T) become MXFP8 (e4m3 values,
+    e8m0 group-32 scales — no underflow by construction) while the S/dP
+    recomputes stay NVFP4. Best memorization (0.230), grad cos 0.978-0.992,
+    1.08x hp at s8192 d256.
+  * "fp4_legacy"  — the original all-FP4 backward (plain packs + the SR
+    knobs). Kept for compatibility; rownorm dominates it on accuracy.
+  * None (AUTO)   — "bf16" below an effective seq of 4096 (the fp4 arms only
+    beat the hp backward from ~4k up), else "fp4_rownorm".
+
+NEGATIVE RESULTS (measured on this hardware; experiment code removed):
+  * SR on the gradient packs is strictly worse AND slower under rownorm
+    (mem 0.244 vs 0.233 RTN; 0.76x hp vs 1.12x) — the e4m3-scale underflow SR
+    was papering over is gone, so the dither only adds variance. The rownorm
+    arms therefore force RTN; the SR knobs remain honored on "fp4_legacy".
+  * e5m2 dS operands (vs e4m3) under fp8: lower grad cos across the board;
+    dS needs mantissa, not exponent range, once e8m0 scales exist.
+  * fp8 grads WITHOUT rownorm: memorization 0.959 (worse than broken legacy)
+    — the NVFP4 dO along-D pack still underflowed; scale quality of the dO/dP
+    operands, not the GEMM format, was the binding constraint.
+  * rank-1 P-quantization-error correction on dV ("plowrank", rc1 and rowmean
+    variants): dv cos 0.59-0.95 (worse than no correction), 0.66x hp.
 
 GQA handled by mapping each query head to its KV head in-kernel (no repeat_kv
 materialization).
@@ -80,7 +114,17 @@ import triton
 import triton.language as tl
 from ._fp4_pack import convert_fp32_to_fp4_packed
 
-_E4M3_EPS = tl.constexpr(1.5258789e-05)
+# Floor for the e4m3-STORED NVFP4 group scale (sc = clamp(amax/6, floor, 448)).
+# Must be e4m3's minimum representable POSITIVE value — the min SUBNORMAL 2^-9
+# (float8_e4m3fn: 3 mantissa bits, min normal 2^-6). A floor below ~2^-10 is a
+# BUG, not a safety margin: the clamped fp32 value ROUNDS TO EXACTLY 0 in the
+# e4m3 cast, so every group whose amax < ~6e-3 got scale 0 and silently exited
+# the GEMM (the legacy backward's accuracy collapse on small gradients; the old
+# floor was 2^-16). Verified empirically (legacy bwd grad cos vs SDPA, s2048):
+# floor 2^-9 -> 0.964-0.979, old 2^-16 -> 0.908, min NORMAL 2^-6 -> 0.901
+# (a 2^-6 floor shrinks the representable band 8x — tiles with amax in
+# [6*2^-10, 6*2^-7) quantize against an oversized scale and flush to 0).
+_E4M3_SCALE_FLOOR = tl.constexpr(0.001953125)
 _F8E4M3_MAX = tl.constexpr(448.0)
 _F4_MAX = tl.constexpr(6.0)
 _NEG_INF = tl.constexpr(-3.4028234663852886e38)
@@ -111,7 +155,7 @@ def _pack_nvfp4_along_k(
     NG: tl.constexpr = K // 16
     xb = x.reshape(ROWS, NG, 16)
     amax = tl.max(tl.abs(xb), axis=2)
-    sc = tl.clamp(amax / _F4_MAX, _E4M3_EPS, _F8E4M3_MAX).to(tl.float8e4nv)
+    sc = tl.clamp(amax / _F4_MAX, _E4M3_SCALE_FLOOR, _F8E4M3_MAX).to(tl.float8e4nv)
     scf = sc.to(tl.float32)[:, :, None]
     xn = xb / scf
     if STOCHASTIC:
@@ -134,6 +178,121 @@ def _pack_nvfp4_along_k(
     pairs = xn.reshape(ROWS * (K // 2), 2).split()
     q = convert_fp32_to_fp4_packed(pairs).reshape(ROWS, K // 2)
     return q, sc
+
+
+# ---------------------------------------------------------------------------
+# Row-normalized NVFP4 pack ("fp4_rownorm"/"fp8_rownorm" backward modes):
+# _pack_nvfp4_along_k of x / rn[:, None] (KVarN-adapted per-row normalization).
+# Row-normalizing the tile then packing leaves the PACKED VALUES unchanged (the
+# per-group amax scale absorbs any row factor exactly); the entire effect is
+# keeping the STORED e4m3 scale mid-range (amax/(rn*6) lands near 1 instead of
+# underflowing the e4m3 representable range for tiny gradient tiles — even the
+# _E4M3_SCALE_FLOOR fix only rescues tiles down to amax ~1e-4; late-training
+# gradients go far below that). The caller must multiply the dot OUTPUT rows by
+# rn afterwards. NOTE: an algebraically equivalent "merged" form
+# (sc=clamp(amax/(rn*6)); xn=xb/(sc*rn)) measured ~12% SLOWER end-to-end
+# (s8192 d256: 9.0 vs 8.07 ms) — the e4m3 cast -> multiply -> divide dependency
+# chain schedules worse than the plain broadcast division, so the simple
+# divide-first form is kept.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _pack_nvfp4_along_k_rn(
+    x,
+    rn,
+    base_off,
+    seed,
+    ROWS: tl.constexpr,
+    K: tl.constexpr,
+    STOCHASTIC: tl.constexpr,
+):
+    NG: tl.constexpr = K // 16
+    xb = (x / rn[:, None]).reshape(ROWS, NG, 16)
+    amax = tl.max(tl.abs(xb), axis=2)
+    sc = tl.clamp(amax / _F4_MAX, _E4M3_SCALE_FLOOR, _F8E4M3_MAX).to(tl.float8e4nv)
+    scf = sc.to(tl.float32)
+    xn = xb / scf[:, :, None]
+    if STOCHASTIC:
+        ax = tl.abs(xn)
+        step = tl.where(ax < 2.0, 1.0, tl.where(ax < 4.0, 2.0, 4.0))
+        off = (
+            base_off
+            + tl.arange(0, ROWS)[:, None, None] * K
+            + tl.arange(0, NG)[None, :, None] * 16
+            + tl.arange(0, 16)[None, None, :]
+        )
+        u = tl.rand(seed, off) - 0.5
+        xn = xn + u * step
+    xn = tl.clamp(xn, -_F4_MAX, _F4_MAX)
+    pairs = xn.reshape(ROWS * (K // 2), 2).split()
+    q = convert_fp32_to_fp4_packed(pairs).reshape(ROWS, K // 2)
+    return q, sc
+
+
+# ---------------------------------------------------------------------------
+# In-kernel MXFP8 pack ("fp8_rownorm" backward mode) of a [ROWS, K] fp32 tile
+# along K (group-32, e8m0 power-of-two scales) returning tl.dot_scaled operands
+# for the "e4m3" format string: packed uint8 [ROWS, K] (byte store, no nibble
+# pack) + uint8 e8m0 scale [ROWS, K//32]. Two structural advantages over the
+# group-16 e4m3-scaled FP4 pack for GRADIENT operands:
+#   * e8m0 scales cover 2^-127..2^127, so tiny-magnitude tiles (late-training dS)
+#     never underflow the stored scale the way amax/6 does in e4m3;
+#   * no convert_fp32_to_fp4_packed nibble-pack ALU in the hot loop.
+# RTN only (fp8 has 8x finer mantissa steps than e2m1; SR adds nothing). Values
+# are e4m3 only: e5m2 dS measured strictly worse (see NEGATIVE RESULTS).
+# ---------------------------------------------------------------------------
+@triton.jit
+def _pack_mxfp8_along_k(
+    x,
+    ROWS: tl.constexpr,
+    K: tl.constexpr,
+):
+    NG: tl.constexpr = K // 32
+    xb = x.reshape(ROWS, NG, 32)
+    amax = tl.max(tl.abs(xb), axis=2)
+    e = tl.ceil(tl.log2(tl.maximum(amax, 1e-30) / 448.0))
+    e = tl.clamp(e, -127.0, 127.0)
+    xn = xb / tl.exp2(e)[:, :, None]
+    q = xn.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
+    sc = (e + 127.0).to(tl.uint8)
+    return q.reshape(ROWS, K), sc
+
+
+# Valid ``backward_grad_dots`` modes (see the module docstring) and the AUTO
+# crossover: the fp4/fp8 grad-dot backwards only beat the hp backward from
+# ~4k effective sequence up (measured crossover is between 2k and 8k on RTX
+# PRO 6000 — 0.82-0.93x hp at s<=2048, 1.08-1.12x hp at s8192). 4096 is the
+# tunable midpoint pick.
+_BWD_GRAD_DOTS_MODES = ("bf16", "fp4_rownorm", "fp8_rownorm", "fp4_legacy")
+_BWD_AUTO_FP4_MIN_SEQ = 4096
+
+
+def _resolve_backward_grad_dots(
+    mode: str | None,
+    eff_seq: float,
+    save_backward_packs: bool,
+    num_key_value_groups: int,
+) -> str:
+    """Resolve the ``backward_grad_dots`` mode (None = AUTO).
+
+    AUTO: "bf16" below ``_BWD_AUTO_FP4_MIN_SEQ`` effective sequence (s_kv, or
+    the mean sample length under cu_seqlens varlen), else "fp4_rownorm".
+
+    "bf16" requires the saved hp q/k/v (incompatible with the packs-only
+    ``save_backward_packs`` saved set) and a GQA group <= 8 (the hp dkdv
+    kernel unrolls the group in-register); either constraint downgrades it to
+    "fp4_rownorm" — mirroring the old boolean knob's silent auto-downgrade to
+    the fp4 backward.
+    """
+    if mode is None:
+        mode = "bf16" if eff_seq < _BWD_AUTO_FP4_MIN_SEQ else "fp4_rownorm"
+    if mode not in _BWD_GRAD_DOTS_MODES:
+        raise ValueError(
+            f"backward_grad_dots must be one of {_BWD_GRAD_DOTS_MODES} or None "
+            f"(auto), got {mode!r}"
+        )
+    if mode == "bf16" and (save_backward_packs or num_key_value_groups > 8):
+        mode = "fp4_rownorm"
+    return mode
 
 
 # ---------------------------------------------------------------------------
@@ -175,7 +334,7 @@ def _quant_nvfp4_kernel(
     NG: tl.constexpr = BLOCK_K // 16
     xb = x.reshape(BLOCK_R, NG, 16)
     amax = tl.max(tl.abs(xb), axis=2)
-    sc = tl.clamp(amax / _F4_MAX, _E4M3_EPS, _F8E4M3_MAX).to(tl.float8e4nv)
+    sc = tl.clamp(amax / _F4_MAX, _E4M3_SCALE_FLOOR, _F8E4M3_MAX).to(tl.float8e4nv)
     xn = xb / sc.to(tl.float32)[:, :, None]
     pairs = xn.reshape(BLOCK_R * (BLOCK_K // 2), 2).split()
     qpk = convert_fp32_to_fp4_packed(pairs).reshape(BLOCK_R, BLOCK_K // 2)
@@ -207,7 +366,7 @@ def _quant_nvfp4(
             quantized via STRIDED reads (no physical transpose/copy) — used for V,
             laid out ``[B, Skv, D]`` and quantized along Skv to produce V^T.
         k_pad: pad the contraction axis to this length (padded groups -> amax 0 ->
-            eps scale, zero packed values), for the PV-GEMM key-axis multiple-of-16.
+            floor scale, zero packed values), for the PV-GEMM key-axis multiple-of-16.
 
     The contraction is tiled by a power-of-2 ``BLOCK_K`` (multiple of 16) so a
     non-power-of-2 key axis is supported.
@@ -300,7 +459,7 @@ def _quant_nvfp4_dual_kernel(
     NGA: tl.constexpr = BLOCK_D // 16
     xa = x.reshape(BLOCK_S, NGA, 16)
     amax_a = tl.max(tl.abs(xa), axis=2)
-    sca = tl.clamp(amax_a / _F4_MAX, _E4M3_EPS, _F8E4M3_MAX).to(tl.float8e4nv)
+    sca = tl.clamp(amax_a / _F4_MAX, _E4M3_SCALE_FLOOR, _F8E4M3_MAX).to(tl.float8e4nv)
     xna = xa / sca.to(tl.float32)[:, :, None]
     pairs_a = xna.reshape(BLOCK_S * (BLOCK_D // 2), 2).split()
     qa = convert_fp32_to_fp4_packed(pairs_a).reshape(BLOCK_S, BLOCK_D // 2)
@@ -322,7 +481,7 @@ def _quant_nvfp4_dual_kernel(
     xt = tl.trans(x)  # [BLOCK_D, BLOCK_S]
     xtb = xt.reshape(BLOCK_D, NGB, 16)
     amax_b = tl.max(tl.abs(xtb), axis=2)
-    scb = tl.clamp(amax_b / _F4_MAX, _E4M3_EPS, _F8E4M3_MAX).to(tl.float8e4nv)
+    scb = tl.clamp(amax_b / _F4_MAX, _E4M3_SCALE_FLOOR, _F8E4M3_MAX).to(tl.float8e4nv)
     xnb = xtb / scb.to(tl.float32)[:, :, None]
     pairs_b = xnb.reshape(BLOCK_D * (BLOCK_S // 2), 2).split()
     qb = convert_fp32_to_fp4_packed(pairs_b).reshape(BLOCK_D, BLOCK_S // 2)
@@ -451,7 +610,7 @@ def _quant_qkv_fwd_kernel(
             ).to(tl.float32)
             NG: tl.constexpr = BLOCK_KD // 16
             xb = x.reshape(BLOCK_R, NG, 16)
-            sc = tl.clamp(tl.max(tl.abs(xb), axis=2) / _F4_MAX, _E4M3_EPS, _F8E4M3_MAX).to(tl.float8e4nv)
+            sc = tl.clamp(tl.max(tl.abs(xb), axis=2) / _F4_MAX, _E4M3_SCALE_FLOOR, _F8E4M3_MAX).to(tl.float8e4nv)
             xn = xb / sc.to(tl.float32)[:, :, None]
             qpk = convert_fp32_to_fp4_packed(xn.reshape(BLOCK_R * (BLOCK_KD // 2), 2).split()).reshape(BLOCK_R, BLOCK_KD // 2)
             offs_qk = tl.arange(0, BLOCK_KD // 2)
@@ -474,7 +633,7 @@ def _quant_qkv_fwd_kernel(
             ).to(tl.float32)
             NG: tl.constexpr = BLOCK_KD // 16
             xb = x.reshape(BLOCK_R, NG, 16)
-            sc = tl.clamp(tl.max(tl.abs(xb), axis=2) / _F4_MAX, _E4M3_EPS, _F8E4M3_MAX).to(tl.float8e4nv)
+            sc = tl.clamp(tl.max(tl.abs(xb), axis=2) / _F4_MAX, _E4M3_SCALE_FLOOR, _F8E4M3_MAX).to(tl.float8e4nv)
             xn = xb / sc.to(tl.float32)[:, :, None]
             qpk = convert_fp32_to_fp4_packed(xn.reshape(BLOCK_R * (BLOCK_KD // 2), 2).split()).reshape(BLOCK_R, BLOCK_KD // 2)
             offs_qk = tl.arange(0, BLOCK_KD // 2)
@@ -497,7 +656,7 @@ def _quant_qkv_fwd_kernel(
             ).to(tl.float32)
             NG: tl.constexpr = BLOCK_KV // 16
             xb = x.reshape(D, NG, 16)
-            sc = tl.clamp(tl.max(tl.abs(xb), axis=2) / _F4_MAX, _E4M3_EPS, _F8E4M3_MAX).to(tl.float8e4nv)
+            sc = tl.clamp(tl.max(tl.abs(xb), axis=2) / _F4_MAX, _E4M3_SCALE_FLOOR, _F8E4M3_MAX).to(tl.float8e4nv)
             xn = xb / sc.to(tl.float32)[:, :, None]
             qpk = convert_fp32_to_fp4_packed(xn.reshape(D * (BLOCK_KV // 2), 2).split()).reshape(D, BLOCK_KV // 2)
             offs_qk = kt * (BLOCK_KV // 2) + tl.arange(0, BLOCK_KV // 2)
@@ -719,7 +878,7 @@ def _flash_fwd_kernel(
         # in-kernel NVFP4 pack of P along the key axis (group-16)
         pb = p.reshape(BLOCK_M, NP16, 16)
         pamax = tl.max(pb, axis=2)  # P>=0
-        psc = tl.clamp(pamax / _F4_MAX, _E4M3_EPS, _F8E4M3_MAX).to(tl.float8e4nv)
+        psc = tl.clamp(pamax / _F4_MAX, _E4M3_SCALE_FLOOR, _F8E4M3_MAX).to(tl.float8e4nv)
         pn = pb / psc.to(tl.float32)[:, :, None]
         ppairs = pn.reshape(BLOCK_M * NP2, 2).split()
         pq = convert_fp32_to_fp4_packed(ppairs).reshape(BLOCK_M, NP2)
@@ -998,6 +1157,8 @@ def _flash_bwd_packprep_kernel(
     dosc_ptr,
     dotnv_ptr,
     dotsc_ptr,
+    dorms_ptr,  # rownorm: OUT [Z*H, Sq] per-token rms of dO over D
+    dotrms_ptr,  # rownorm: IN  [Z*H, D] per-feature rms of dO over Sq
     seed,
     Sq,
     Sq_pad,
@@ -1022,6 +1183,8 @@ def _flash_bwd_packprep_kernel(
     STORE_DO: tl.constexpr,
     DO_ZSHD: tl.constexpr,
     O_ZSHD: tl.constexpr,
+    RN_DO: tl.constexpr,  # rownorm modes: row-normalize the dO/doT packs
+    FP8_GRAD: tl.constexpr,  # fp8_rownorm: doT/qT packs are MXFP8 instead of NVFP4
     BLOCK_M: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
@@ -1041,6 +1204,12 @@ def _flash_bwd_packprep_kernel(
     offs_mp = pid_m * MP2 + tl.arange(0, MP2)
     offs_msc = pid_m * MP16 + tl.arange(0, MP16)
 
+    # FP8 transposed-pack layout: element stride Sq_pad (byte/elt), group-32
+    # e8m0 scales -> stride Sq_pad//32.
+    offs_me = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_m32 = pid_m * (BLOCK_M // 32) + tl.arange(0, BLOCK_M // 32)
+    sq32 = Sq_pad // 32
+
     if STORE_Q or STORE_QT:
         q = tl.load(
             q_ptr + pid_zh * (Sq * sq_n) + offs_m[:, None] * sq_n + offs_d[None, :],
@@ -1050,9 +1219,12 @@ def _flash_bwd_packprep_kernel(
         if STORE_Q:
             qnv, qsc = _pack_nvfp4_along_k(q, 0, seed, BLOCK_M, D, False)
         if STORE_QT:
-            qtnv, qtsc = _pack_nvfp4_along_k(
-                tl.trans(q), 4 * Sq, seed, D, BLOCK_M, False
-            )
+            if FP8_GRAD:
+                qt8, qt8s = _pack_mxfp8_along_k(tl.trans(q), D, BLOCK_M)
+            else:
+                qtnv, qtsc = _pack_nvfp4_along_k(
+                    tl.trans(q), 4 * Sq, seed, D, BLOCK_M, False
+                )
 
     if STORE_Q:
         tl.store(
@@ -1068,14 +1240,27 @@ def _flash_bwd_packprep_kernel(
     sq2 = Sq_pad // 2
     sq16 = Sq_pad // 16
     if STORE_QT:
-        tl.store(
-            qtnv_ptr + pid_zh * (D * sq2) + offs_d[:, None] * sq2 + offs_mp[None, :],
-            qtnv,
-        )
-        tl.store(
-            qtsc_ptr + pid_zh * (D * sq16) + offs_d[:, None] * sq16 + offs_msc[None, :],
-            qtsc.to(tl.uint8, bitcast=True),
-        )
+        if FP8_GRAD:
+            tl.store(
+                qtnv_ptr
+                + pid_zh * (D * Sq_pad)
+                + offs_d[:, None] * Sq_pad
+                + offs_me[None, :],
+                qt8,
+            )
+            tl.store(
+                qtsc_ptr + pid_zh * (D * sq32) + offs_d[:, None] * sq32 + offs_m32[None, :],
+                qt8s,
+            )
+        else:
+            tl.store(
+                qtnv_ptr + pid_zh * (D * sq2) + offs_d[:, None] * sq2 + offs_mp[None, :],
+                qtnv,
+            )
+            tl.store(
+                qtsc_ptr + pid_zh * (D * sq16) + offs_d[:, None] * sq16 + offs_msc[None, :],
+                qtsc.to(tl.uint8, bitcast=True),
+            )
 
     if DO_ZSHD:
         do = tl.load(
@@ -1119,12 +1304,26 @@ def _flash_bwd_packprep_kernel(
         delta = tl.sum(do * o, axis=1)
         tl.store(delta_ptr + pid_zh * Sq + offs_m, delta, mask=mmask)
 
+    if RN_DO:
+        # per-token rms over D (exact: full D in-tile). Stored for the dpT/dp
+        # output-row rescale in the dkdv/dq kernels.
+        dorm = tl.sqrt(tl.sum(do * do, axis=1) / D)
+        dorm = tl.where(dorm == 0.0, 1.0, dorm)
+        tl.store(dorms_ptr + pid_zh * Sq + offs_m, dorm, mask=mmask)
+        # per-feature rms over Sq (global; precomputed torch-side) for the doT
+        # pack: the doT contraction spans all of Sq so only a GLOBAL per-d
+        # factor folds out of the dV GEMM. The FP8 doT pack (e8m0) skips it.
+        if not FP8_GRAD:
+            dotrm = tl.load(dotrms_ptr + pid_zh * D + offs_d)
+
     if STORE_DO:
         mblk = pid_m * (BLOCK_M * D)
-        donv, dosc = _pack_nvfp4_along_k(do, 2 * Sq + mblk, seed, BLOCK_M, D, SR_DO)
-        dotnv, dotsc = _pack_nvfp4_along_k(
-            tl.trans(do), Sq + mblk, seed, D, BLOCK_M, SR_DOT
-        )
+        if RN_DO:
+            donv, dosc = _pack_nvfp4_along_k_rn(
+                do, dorm, 2 * Sq + mblk, seed, BLOCK_M, D, SR_DO
+            )
+        else:
+            donv, dosc = _pack_nvfp4_along_k(do, 2 * Sq + mblk, seed, BLOCK_M, D, SR_DO)
 
         tl.store(
             donv_ptr + pid_zh * (Sq * DP2) + offs_m[:, None] * DP2 + offs_dp[None, :],
@@ -1139,14 +1338,40 @@ def _flash_bwd_packprep_kernel(
             dosc.to(tl.uint8, bitcast=True),
             mask=mmask[:, None],
         )
-        tl.store(
-            dotnv_ptr + pid_zh * (D * sq2) + offs_d[:, None] * sq2 + offs_mp[None, :],
-            dotnv,
-        )
-        tl.store(
-            dotsc_ptr + pid_zh * (D * sq16) + offs_d[:, None] * sq16 + offs_msc[None, :],
-            dotsc.to(tl.uint8, bitcast=True),
-        )
+        if FP8_GRAD:
+            # e8m0 group-32 scales never underflow — no rownorm needed/applied.
+            dot8, dot8s = _pack_mxfp8_along_k(tl.trans(do), D, BLOCK_M)
+            tl.store(
+                dotnv_ptr
+                + pid_zh * (D * Sq_pad)
+                + offs_d[:, None] * Sq_pad
+                + offs_me[None, :],
+                dot8,
+            )
+            tl.store(
+                dotsc_ptr
+                + pid_zh * (D * sq32)
+                + offs_d[:, None] * sq32
+                + offs_m32[None, :],
+                dot8s,
+            )
+        else:
+            if RN_DO:
+                dotnv, dotsc = _pack_nvfp4_along_k_rn(
+                    tl.trans(do), dotrm, Sq + mblk, seed, D, BLOCK_M, SR_DOT
+                )
+            else:
+                dotnv, dotsc = _pack_nvfp4_along_k(
+                    tl.trans(do), Sq + mblk, seed, D, BLOCK_M, SR_DOT
+                )
+            tl.store(
+                dotnv_ptr + pid_zh * (D * sq2) + offs_d[:, None] * sq2 + offs_mp[None, :],
+                dotnv,
+            )
+            tl.store(
+                dotsc_ptr + pid_zh * (D * sq16) + offs_d[:, None] * sq16 + offs_msc[None, :],
+                dotsc.to(tl.uint8, bitcast=True),
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1174,6 +1399,7 @@ def _flash_bwd_kprep_kernel(
     STORE_K: tl.constexpr,
     STORE_V: tl.constexpr,
     STORE_KT: tl.constexpr,
+    FP8_KT: tl.constexpr,  # fp8_rownorm: K^T (dQ GEMM stationary operand) as MXFP8
     BLOCK_N: tl.constexpr,
 ):
     pid_n = tl.program_id(0)
@@ -1191,7 +1417,10 @@ def _flash_bwd_kprep_kernel(
         if STORE_K:
             knv, ksc = _pack_nvfp4_along_k(k, 0, seed, BLOCK_N, D, False)
         if STORE_KT:
-            kTnv, kTsc = _pack_nvfp4_along_k(tl.trans(k), 0, seed, D, BLOCK_N, False)
+            if FP8_KT:
+                kT8, kT8s = _pack_mxfp8_along_k(tl.trans(k), D, BLOCK_N)
+            else:
+                kTnv, kTsc = _pack_nvfp4_along_k(tl.trans(k), 0, seed, D, BLOCK_N, False)
     if STORE_V:
         v = tl.load(
             v_ptr + pid_zhk * (Skv * sv_n) + offs_n[:, None] * sv_n + offs_d[None, :],
@@ -1240,17 +1469,36 @@ def _flash_bwd_kprep_kernel(
     sk2 = Skv_pad // 2
     sk16 = Skv_pad // 16
     if STORE_KT:
-        tl.store(
-            ktnv_ptr + pid_zhk * (D * sk2) + offs_d[:, None] * sk2 + offs_np[None, :],
-            kTnv,
-        )
-        tl.store(
-            ktsc_ptr
-            + pid_zhk * (D * sk16)
-            + offs_d[:, None] * sk16
-            + offs_nsc[None, :],
-            kTsc.to(tl.uint8, bitcast=True),
-        )
+        if FP8_KT:
+            sk32 = Skv_pad // 32
+            offs_ne = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+            offs_n32 = pid_n * (BLOCK_N // 32) + tl.arange(0, BLOCK_N // 32)
+            tl.store(
+                ktnv_ptr
+                + pid_zhk * (D * Skv_pad)
+                + offs_d[:, None] * Skv_pad
+                + offs_ne[None, :],
+                kT8,
+            )
+            tl.store(
+                ktsc_ptr
+                + pid_zhk * (D * sk32)
+                + offs_d[:, None] * sk32
+                + offs_n32[None, :],
+                kT8s,
+            )
+        else:
+            tl.store(
+                ktnv_ptr + pid_zhk * (D * sk2) + offs_d[:, None] * sk2 + offs_np[None, :],
+                kTnv,
+            )
+            tl.store(
+                ktsc_ptr
+                + pid_zhk * (D * sk16)
+                + offs_d[:, None] * sk16
+                + offs_nsc[None, :],
+                kTsc.to(tl.uint8, bitcast=True),
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1286,10 +1534,14 @@ def _flash_bwd_dkdv_kernel(
     vnv_ptr,
     vsc_ptr,
     bias_ptr,
+    seqid_ptr,  # VARLEN: [S] int32 per-token sample index (Sq == Skv)
+    seqend_ptr,  # VARLEN: [S] int32 one-past-sample-end of each token
     lse_ptr,
     delta_ptr,
     dk_ptr,
     dv_ptr,
+    dorms_ptr,  # rownorm: [Z*H, Sq] per-token rms of dO over D
+    dotrms_ptr,  # rownorm: [Z*H, D] per-feature rms of dO over Sq
     scaling,
     seed,
     Sq,
@@ -1303,8 +1555,12 @@ def _flash_bwd_dkdv_kernel(
     sdv_n,
     HAS_BIAS: tl.constexpr,
     CAUSAL: tl.constexpr,
+    VARLEN: tl.constexpr,
     SR: tl.constexpr,
     SR_P_DV: tl.constexpr,
+    RN: tl.constexpr,  # fp4_rownorm: rownorm the in-loop pT/dSt packs
+    RN_DO: tl.constexpr,  # rownorm modes: dO/doT packs are row-normalized (packprep)
+    FP8: tl.constexpr,  # fp8_rownorm: pT/dSt/doT/qT GEMM operands are MXFP8
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
@@ -1320,14 +1576,16 @@ def _flash_bwd_dkdv_kernel(
 
     DP2: tl.constexpr = D // 2
     DP16: tl.constexpr = D // 16
-    MP2: tl.constexpr = BLOCK_M // 2
-    MP16: tl.constexpr = BLOCK_M // 16
+    # transposed (along-M) pack geometry: nibble-packed group-16 for NVFP4,
+    # byte-per-elt group-32 for MXFP8
+    MP2: tl.constexpr = BLOCK_M if FP8 else BLOCK_M // 2
+    MP16: tl.constexpr = (BLOCK_M // 32) if FP8 else (BLOCK_M // 16)
     offs_dp = tl.arange(0, DP2)
     offs_dsc = tl.arange(0, DP16)
     offs_mp0 = tl.arange(0, MP2)
     offs_msc0 = tl.arange(0, MP16)
-    sq2 = Sq_pad // 2
-    sq16 = Sq_pad // 16
+    sq2 = Sq_pad if FP8 else Sq_pad // 2
+    sq16 = (Sq_pad // 32) if FP8 else (Sq_pad // 16)
 
     knv = tl.load(
         knv_ptr + zhk * (Skv * DP2) + offs_n[:, None] * DP2 + offs_dp[None, :],
@@ -1357,8 +1615,17 @@ def _flash_bwd_dkdv_kernel(
         lo = tl.maximum(((pid_n * BLOCK_N - (Skv - Sq)) // BLOCK_M) * BLOCK_M, 0)
     else:
         lo = 0
+    if VARLEN:
+        # Block-diagonal-causal m bounds for this key tile (same predicate as
+        # the hp dkdv kernel): the causal lo dominates aligned(min seq_start);
+        # hi: no query past the LAST sample's end attends any key here.
+        idx_n = tl.minimum(offs_n, Skv - 1)
+        seq_id_k = tl.load(seqid_ptr + idx_n)
+        hi_m = tl.max(tl.load(seqend_ptr + idx_n))
+    else:
+        hi_m = Sq
 
-    for start_m in range(lo, Sq, BLOCK_M):
+    for start_m in range(lo, hi_m, BLOCK_M):
         offs_m = start_m + tl.arange(0, BLOCK_M)
         mmask = offs_m < Sq
         # load precomputed FP4 packs (quantized once in the pack-prep pass)
@@ -1372,8 +1639,12 @@ def _flash_bwd_dkdv_kernel(
             mask=mmask[:, None],
             other=0,
         ).to(tl.float8e4nv, bitcast=True)
-        mp = (start_m // 2) + offs_mp0
-        msc = (start_m // 16) + offs_msc0
+        if FP8:
+            mp = start_m + offs_mp0
+            msc = (start_m // 32) + offs_msc0
+        else:
+            mp = (start_m // 2) + offs_mp0
+            msc = (start_m // 16) + offs_msc0
         lse = tl.load(lse_ptr + pid_zh * Sq + offs_m, mask=mmask, other=0.0)
         delta = tl.load(delta_ptr + pid_zh * Sq + offs_m, mask=mmask, other=0.0)
 
@@ -1386,18 +1657,46 @@ def _flash_bwd_dkdv_kernel(
         if CAUSAL:
             causal_ok = offs_n[:, None] <= (offs_m[None, :] + (Skv - Sq))
             sT = tl.where(causal_ok, sT, _NEG_INF)
+        if VARLEN:
+            # same block-diagonal predicate as the forward (transposed frame),
+            # so pT = exp(sT - lse) matches the forward softmax.
+            seq_id_q = tl.load(seqid_ptr + tl.minimum(offs_m, Sq - 1))
+            same_seq = seq_id_k[:, None] == seq_id_q[None, :]
+            sT = tl.where(same_seq, sT, _NEG_INF)
         pT = tl.exp(sT - lse[None, :])
         pT = tl.where(sT == _NEG_INF, 0.0, pT)
 
-        # dV += pT @ dO^T.T  (contract M). pT [BLOCK_N, BLOCK_M] (SR), dO^T precomputed.
-        pT_q, pT_s = _pack_nvfp4_along_k(pT, start_m, seed, BLOCK_N, BLOCK_M, SR_P_DV)
+        # dV += pT @ dO^T.T  (contract M). pT [BLOCK_N, BLOCK_M], dO^T precomputed.
+        # rownorm note: rownorm of an OPERAND tile is absorbed by the per-group
+        # amax scale; its entire value is keeping the stored e4m3 scale in
+        # range, so it is folded into the pack (_pack_nvfp4_along_k_rn) and the
+        # dot output rows are multiplied back. MXFP8 packs (e8m0 scales, no
+        # underflow) gain nothing from rownorm — the FP8 mode skips it in-loop
+        # (the driver passes RN=False alongside FP8).
         dotnv = tl.load(
             dotnv_ptr + pid_zh * (D * sq2) + offs_d[:, None] * sq2 + mp[None, :],
         )
-        dotsc = tl.load(
+        dotsc_u8 = tl.load(
             dotsc_ptr + pid_zh * (D * sq16) + offs_d[:, None] * sq16 + msc[None, :],
-        ).to(tl.float8e4nv, bitcast=True)
-        dv = tl.dot_scaled(pT_q, pT_s, "e2m1", dotnv.T, dotsc, "e2m1", acc=dv)
+        )
+        if FP8:
+            pT_q8, pT_s8 = _pack_mxfp8_along_k(pT, BLOCK_N, BLOCK_M)
+            dv = tl.dot_scaled(pT_q8, pT_s8, "e4m3", dotnv.T, dotsc_u8, "e4m3", acc=dv)
+        else:
+            dotsc = dotsc_u8.to(tl.float8e4nv, bitcast=True)
+            if RN:
+                rn_p = tl.sqrt(tl.sum(pT * pT, axis=1) / BLOCK_M)
+                rn_p = tl.where(rn_p == 0.0, 1.0, rn_p)
+                pT_q, pT_s = _pack_nvfp4_along_k_rn(
+                    pT, rn_p, start_m, seed, BLOCK_N, BLOCK_M, SR_P_DV
+                )
+                dv_it = tl.dot_scaled(pT_q, pT_s, "e2m1", dotnv.T, dotsc, "e2m1")
+                dv += dv_it * rn_p[:, None]
+            else:
+                pT_q, pT_s = _pack_nvfp4_along_k(
+                    pT, start_m, seed, BLOCK_N, BLOCK_M, SR_P_DV
+                )
+                dv = tl.dot_scaled(pT_q, pT_s, "e2m1", dotnv.T, dotsc, "e2m1", acc=dv)
 
         # dPt[n,m] = sum_d V[n,d] dO[m,d]  (contract D). dO precomputed (SR).
         donv = tl.load(
@@ -1414,21 +1713,47 @@ def _flash_bwd_dkdv_kernel(
             other=0,
         ).to(tl.float8e4nv, bitcast=True)
         dpT = tl.dot_scaled(vnv, vsc, "e2m1", donv.T, dosc, "e2m1")
+        if RN_DO:
+            # dO rows (tokens) were normalized in packprep; restore on the dot
+            # output columns (the dpT column axis is the token axis m).
+            dorm = tl.load(dorms_ptr + pid_zh * Sq + offs_m, mask=mmask, other=1.0)
+            dpT = dpT * dorm[None, :]
 
         dsT = pT * (dpT - delta[None, :]) * scaling
         dsT = tl.where(pT == 0.0, 0.0, dsT)
 
-        # dK += dSt @ Q^T.T  (contract M). dSt [BLOCK_N, BLOCK_M] (SR), Q^T precomputed (RTN).
-        dsT_q, dsT_s = _pack_nvfp4_along_k(
-            dsT, start_m + 3 * Sq, seed, BLOCK_N, BLOCK_M, SR
-        )
+        # dK += dSt @ Q^T.T  (contract M). dSt [BLOCK_N, BLOCK_M], Q^T precomputed (RTN).
         qtnv = tl.load(
             qtnv_ptr + pid_zh * (D * sq2) + offs_d[:, None] * sq2 + mp[None, :],
         )
-        qtsc = tl.load(
+        qtsc_u8 = tl.load(
             qtsc_ptr + pid_zh * (D * sq16) + offs_d[:, None] * sq16 + msc[None, :],
-        ).to(tl.float8e4nv, bitcast=True)
-        dk = tl.dot_scaled(dsT_q, dsT_s, "e2m1", qtnv.T, qtsc, "e2m1", acc=dk)
+        )
+        if FP8:
+            dsT_q8, dsT_s8 = _pack_mxfp8_along_k(dsT, BLOCK_N, BLOCK_M)
+            dk = tl.dot_scaled(dsT_q8, dsT_s8, "e4m3", qtnv.T, qtsc_u8, "e4m3", acc=dk)
+        else:
+            qtsc = qtsc_u8.to(tl.float8e4nv, bitcast=True)
+            if RN:
+                rn_s = tl.sqrt(tl.sum(dsT * dsT, axis=1) / BLOCK_M)
+                rn_s = tl.where(rn_s == 0.0, 1.0, rn_s)
+                dsT_q, dsT_s = _pack_nvfp4_along_k_rn(
+                    dsT, rn_s, start_m + 3 * Sq, seed, BLOCK_N, BLOCK_M, SR
+                )
+                dk_it = tl.dot_scaled(dsT_q, dsT_s, "e2m1", qtnv.T, qtsc, "e2m1")
+                dk += dk_it * rn_s[:, None]
+            else:
+                dsT_q, dsT_s = _pack_nvfp4_along_k(
+                    dsT, start_m + 3 * Sq, seed, BLOCK_N, BLOCK_M, SR
+                )
+                dk = tl.dot_scaled(dsT_q, dsT_s, "e2m1", qtnv.T, qtsc, "e2m1", acc=dk)
+
+    if RN_DO and not FP8:
+        # doT rows (features d) were normalized by the GLOBAL per-feature rms;
+        # restore on the dV output columns once, after the loop. Under FP8 the
+        # doT pack is e8m0-scaled and NOT normalized (no underflow to fix).
+        dotrm = tl.load(dotrms_ptr + pid_zh * D + offs_d)
+        dv = dv * dotrm[None, :]
 
     tl.store(
         dk_ptr + pid_zh * (Skv * sdk_n) + offs_n[:, None] * sdk_n + offs_d[None, :],
@@ -1460,9 +1785,12 @@ def _flash_bwd_dq_kernel(
     vsc_ptr,
     ktnv_ptr,
     ktsc_ptr,
+    seqid_ptr,  # VARLEN: [S] int32 per-token sample index
+    seqstart_ptr,  # VARLEN: [S] int32 first token index of each token's sample
     lse_ptr,
     delta_ptr,
     dq_ptr,
+    dorms_ptr,  # rownorm: [Z*H, Sq] per-token rms of dO over D
     scaling,
     seed,
     Sq,
@@ -1475,7 +1803,11 @@ def _flash_bwd_dq_kernel(
     sdq_n,
     HAS_BIAS: tl.constexpr,
     CAUSAL: tl.constexpr,
+    VARLEN: tl.constexpr,
     SR_DS_DQ: tl.constexpr,
+    RN: tl.constexpr,  # fp4_rownorm: rownorm the in-loop dS pack
+    RN_DO: tl.constexpr,  # rownorm modes: dO pack is row-normalized (packprep)
+    FP8: tl.constexpr,  # fp8_rownorm: dS/K^T GEMM operands are MXFP8
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
@@ -1491,14 +1823,14 @@ def _flash_bwd_dq_kernel(
 
     DP2: tl.constexpr = D // 2
     DP16: tl.constexpr = D // 16
-    NP2: tl.constexpr = BLOCK_N // 2
-    NP16: tl.constexpr = BLOCK_N // 16
+    NP2: tl.constexpr = BLOCK_N if FP8 else BLOCK_N // 2
+    NP16: tl.constexpr = (BLOCK_N // 32) if FP8 else (BLOCK_N // 16)
     offs_dp = tl.arange(0, DP2)
     offs_dsc = tl.arange(0, DP16)
     offs_np0 = tl.arange(0, NP2)
     offs_nsc0 = tl.arange(0, NP16)
-    sk2 = Skv_pad // 2
-    sk16 = Skv_pad // 16
+    sk2 = Skv_pad if FP8 else Skv_pad // 2
+    sk16 = (Skv_pad // 32) if FP8 else (Skv_pad // 16)
 
     qnv = tl.load(
         qnv_ptr + pid_zh * (Sq * DP2) + offs_m[:, None] * DP2 + offs_dp[None, :],
@@ -1522,14 +1854,24 @@ def _flash_bwd_dq_kernel(
     ).to(tl.float8e4nv, bitcast=True)
     lse = tl.load(lse_ptr + pid_zh * Sq + offs_m, mask=mmask, other=0.0)
     delta = tl.load(delta_ptr + pid_zh * Sq + offs_m, mask=mmask, other=0.0)
+    if RN_DO:
+        dorm = tl.load(dorms_ptr + pid_zh * Sq + offs_m, mask=mmask, other=1.0)
 
     dq = tl.zeros((BLOCK_M, D), dtype=tl.float32)
     if CAUSAL:
         hi = tl.minimum(Skv, (pid_m * BLOCK_M + BLOCK_M) + (Skv - Sq))
     else:
         hi = Skv
+    if VARLEN:
+        # block-diagonal: skip key tiles before this tile's earliest sample
+        # (same predicate as the hp dq kernel).
+        idx_m = tl.minimum(offs_m, Sq - 1)
+        seq_id_q = tl.load(seqid_ptr + idx_m)
+        lo = (tl.min(tl.load(seqstart_ptr + idx_m)) // BLOCK_N) * BLOCK_N
+    else:
+        lo = 0
 
-    for start_n in range(0, hi, BLOCK_N):
+    for start_n in range(lo, hi, BLOCK_N):
         offs_n = start_n + tl.arange(0, BLOCK_N)
         nmask = offs_n < Skv
         # precomputed K-side packs: load each layout close to the GEMM that uses it.
@@ -1552,6 +1894,11 @@ def _flash_bwd_dq_kernel(
         if CAUSAL:
             causal_ok = offs_n[None, :] <= (offs_m[:, None] + (Skv - Sq))
             s = tl.where(causal_ok, s, _NEG_INF)
+        if VARLEN:
+            # same block-diagonal predicate as the forward, consistent with lse
+            seq_id_k = tl.load(seqid_ptr + tl.minimum(offs_n, Skv - 1))
+            same_seq = seq_id_q[:, None] == seq_id_k[None, :]
+            s = tl.where(same_seq, s, _NEG_INF)
         p = tl.exp(s - lse[:, None])
         p = tl.where(s == _NEG_INF, 0.0, p)
 
@@ -1566,22 +1913,43 @@ def _flash_bwd_dq_kernel(
             other=0,
         ).to(tl.float8e4nv, bitcast=True)
         dp = tl.dot_scaled(do_q, do_s, "e2m1", vnv.T, vsc, "e2m1")
+        if RN_DO:
+            # dO rows were normalized in packprep; dp rows are the token axis m.
+            dp = dp * dorm[:, None]
         ds = p * (dp - delta[:, None]) * scaling
         ds = tl.where(p == 0.0, 0.0, ds)
 
-        # dQ += dS @ K  (contract N). dS [BLOCK_M, BLOCK_N] (SR), K^T precomputed.
-        ds_q, ds_s = _pack_nvfp4_along_k(
-            ds, start_n + pid_m * Skv, seed, BLOCK_M, BLOCK_N, SR_DS_DQ
-        )
-        np_ = (start_n // 2) + offs_np0
-        nsc = (start_n // 16) + offs_nsc0
+        # dQ += dS @ K  (contract N). dS [BLOCK_M, BLOCK_N], K^T precomputed.
+        if FP8:
+            np_ = start_n + offs_np0
+            nsc = (start_n // 32) + offs_nsc0
+        else:
+            np_ = (start_n // 2) + offs_np0
+            nsc = (start_n // 16) + offs_nsc0
         kTnv = tl.load(
             ktnv_ptr + zhk * (D * sk2) + offs_d[:, None] * sk2 + np_[None, :],
         )
-        kTsc = tl.load(
+        kTsc_u8 = tl.load(
             ktsc_ptr + zhk * (D * sk16) + offs_d[:, None] * sk16 + nsc[None, :],
-        ).to(tl.float8e4nv, bitcast=True)
-        dq = tl.dot_scaled(ds_q, ds_s, "e2m1", kTnv.T, kTsc, "e2m1", acc=dq)
+        )
+        if FP8:
+            ds_q8, ds_s8 = _pack_mxfp8_along_k(ds, BLOCK_M, BLOCK_N)
+            dq = tl.dot_scaled(ds_q8, ds_s8, "e4m3", kTnv.T, kTsc_u8, "e4m3", acc=dq)
+        else:
+            kTsc = kTsc_u8.to(tl.float8e4nv, bitcast=True)
+            if RN:
+                rn_s = tl.sqrt(tl.sum(ds * ds, axis=1) / BLOCK_N)
+                rn_s = tl.where(rn_s == 0.0, 1.0, rn_s)
+                ds_q, ds_s = _pack_nvfp4_along_k_rn(
+                    ds, rn_s, start_n + pid_m * Skv, seed, BLOCK_M, BLOCK_N, SR_DS_DQ
+                )
+                dq_it = tl.dot_scaled(ds_q, ds_s, "e2m1", kTnv.T, kTsc, "e2m1")
+                dq += dq_it * rn_s[:, None]
+            else:
+                ds_q, ds_s = _pack_nvfp4_along_k(
+                    ds, start_n + pid_m * Skv, seed, BLOCK_M, BLOCK_N, SR_DS_DQ
+                )
+                dq = tl.dot_scaled(ds_q, ds_s, "e2m1", kTnv.T, kTsc, "e2m1", acc=dq)
 
     tl.store(
         dq_ptr + pid_zh * (Sq * sdq_n) + offs_m[:, None] * sdq_n + offs_d[None, :],
@@ -2697,7 +3065,7 @@ def _flash_decode_kernel(
 
         pb = p.reshape(BLOCK_M, NP16, 16)
         pamax = tl.max(pb, axis=2)
-        psc = tl.clamp(pamax / _F4_MAX, _E4M3_EPS, _F8E4M3_MAX).to(tl.float8e4nv)
+        psc = tl.clamp(pamax / _F4_MAX, _E4M3_SCALE_FLOOR, _F8E4M3_MAX).to(tl.float8e4nv)
         pn = pb / psc.to(tl.float32)[:, :, None]
         ppairs = pn.reshape(BLOCK_M * NP2, 2).split()
         pq = convert_fp32_to_fp4_packed(ppairs).reshape(BLOCK_M, NP2)
@@ -3151,6 +3519,8 @@ def _run_bwd_hp(
         qsc_p,
         qnv_p,
         qsc_p,
+        delta,  # unused rownorm slots (RN_DO=False)
+        delta,
         0,
         s_q,
         s_q,
@@ -3175,6 +3545,8 @@ def _run_bwd_hp(
         STORE_DO=False,
         DO_ZSHD=do_zshd,
         O_ZSHD=o_zshd,
+        RN_DO=False,
+        FP8_GRAD=False,
         BLOCK_M=pp_block_m,
         num_warps=8,
         num_stages=2,
@@ -3203,6 +3575,7 @@ def _run_bwd_hp(
         STORE_K=True,
         STORE_V=False,
         STORE_KT=False,
+        FP8_KT=False,
         BLOCK_N=kprep_block_n,
         num_warps=8,
         num_stages=2,
@@ -3360,20 +3733,59 @@ def _run_bwd(
     ktsc_saved=None,
     do_zshd=False,
     o_zshd=False,
+    grad_dots="fp4_legacy",
+    seq_arrays=None,
 ):
     """Native-NVFP4 backward. q/do/o: [Z*H,Sq,D]; k/v: [Z*Hk,Skv,D] (hp).
     Returns dq [Z*H,Sq,D], dk/dv [Z*H,Skv,D] (per query head; GQA-reduced by the caller).
+
+    ``grad_dots``: "fp4_legacy" (plain NVFP4 grad packs, honors the SR knobs),
+    "fp4_rownorm" (row-RMS-normalized NVFP4 grad packs) or "fp8_rownorm"
+    (MXFP8 grad operands + rownormed dO pack). The rownorm modes force RTN on
+    the grad packs: SR is strictly worse and slower once the e4m3 scales no
+    longer underflow (see the module NEGATIVE RESULTS).
+
+    ``seq_arrays``: optional ``(seq_id, seq_start, seq_end)`` int32 [S] device
+    arrays from ``_varlen_seq_arrays`` — packed-varlen (block-diagonal causal)
+    masking + loop bounds, same predicates as the hp backward. Requires causal
+    and the forward ``lse``.
 
     If ``lse`` (the forward's per-row logsumexp, [Z*H,Sq]) is supplied, the prep
     kernel reuses it instead of recomputing it with a full FP4 QK^T pass."""
     have_lse = lse is not None
     if (do_zshd or o_zshd) and not have_lse:
         raise ValueError("zshd backward inputs require forward LSE reuse")
+    assert grad_dots in ("fp4_legacy", "fp4_rownorm", "fp8_rownorm"), grad_dots
+    varlen = seq_arrays is not None
+    if varlen:
+        assert causal, "varlen backward requires causal=True"
+        assert have_lse, "varlen backward requires the forward lse"
+        seq_id, seq_start, seq_end = seq_arrays
+    else:
+        seq_id = seq_start = seq_end = q  # dummy ptrs (VARLEN=False prunes loads)
     reuse_q_pack = qnv_saved is not None and qsc_saved is not None
     reuse_qt_pack = qtnv_saved is not None and qtsc_saved is not None
     reuse_k_pack = knv_saved is not None and ksc_saved is not None
     reuse_v_pack = vnv_saved is not None and vsc_saved is not None
     reuse_kt_pack = ktnv_saved is not None and ktsc_saved is not None
+    # rn: rownorm the in-loop NVFP4 grad packs (pT/dSt/dS) + the doT pack.
+    # rn_do: rownorm the along-D dO pack (both rownorm modes — it stays NVFP4
+    # even under fp8, where only the transposed/in-loop GEMM operands change).
+    # fp8: MXFP8 (e4m3 + e8m0 group-32) grad-side GEMM operands.
+    rn = grad_dots == "fp4_rownorm"
+    rn_do = grad_dots in ("fp4_rownorm", "fp8_rownorm")
+    fp8 = grad_dots == "fp8_rownorm"
+    if fp8:
+        assert not (reuse_qt_pack or reuse_kt_pack), (
+            "fp8_rownorm repacks Q^T/K^T as MXFP8; incompatible with saved "
+            "forward FP4 transposed packs (save_backward_packs)"
+        )
+    if rn_do and not fp8:
+        assert not do_zshd, "fp4_rownorm needs contiguous [Z*H,Sq,D] dO"
+    if grad_dots != "fp4_legacy":
+        # rownorm modes are RTN-only (measured: SR strictly worse and slower
+        # once the scale underflow is gone) — the SR knobs become no-ops.
+        sr = sr_p_dv = sr_dot_dv = sr_ds_dq = False
     dkdv_scratch_dtype = torch.bfloat16 if dkdv_scratch_bf16 else torch.float32
     # dq accumulates in fp32 registers and only downcasts at the final store, so a
     # bf16 scratch buffer is bit-identical to fp32-then-.to(bf16) here — a pure
@@ -3403,6 +3815,10 @@ def _run_bwd(
     dkdv_block_n = 32 if d <= 256 else 32
     dkdv_warps = 8
     dkdv_stages = 2 if d == 256 and s_q >= 4096 else 3
+    if fp8 and d == 256:
+        # fp8 byte operands double the transposed-tile SRAM footprint; 3-stage
+        # pipelining overflows the 99KB budget at D=256.
+        dkdv_stages = 2
     # dq loops over key blocks (already cheap). q/do are prepacked in HBM, which
     # trims the loop footprint; two stages win at short seq, while long seq can use
     # the extra overlap from a third stage.
@@ -3416,6 +3832,8 @@ def _run_bwd(
         dq_block_n = d // 2
     dq_warps = max(num_warps, 8)
     dq_stages = 3 if s_q >= 4096 else 2
+    if fp8 and d == 256:
+        dq_stages = 2  # same SRAM pressure as the dkdv fp8 case
     if os.environ.get("NVFP4_BWD_TILE_OVERRIDE"):  # sweep instrumentation
         _e = os.environ
         block_m = int(_e.get("NVFP4_BWD_BM", block_m))
@@ -3492,22 +3910,42 @@ def _run_bwd(
         qsc_p = q.new_empty(z * h, s_q, d // 16, dtype=torch.uint8)
     donv_p = q.new_empty(z * h, s_q, d // 2, dtype=torch.uint8)
     dosc_p = q.new_empty(z * h, s_q, d // 16, dtype=torch.uint8)
+    # transposed-pack geometry: NVFP4 nibble-packs 2 elts/byte with group-16
+    # scales; the fp8 mode stores 1 byte/elt with group-32 e8m0 scales. For
+    # fp8 the PAD region must be zeroed too (a garbage e4m3 byte can be NaN and
+    # e8m0 scale bytes are never exactly 0), so zero-alloc both planes on pad.
+    tp_div, tsc_div = (1, 32) if fp8 else (2, 16)
+    tp_alloc = q.new_zeros if (fp8 and s_q_pad != s_q) else q.new_empty
     if reuse_qt_pack:
         qtnv_p = qtnv_saved.view(torch.uint8)
         qtsc_p = qtsc_saved
     else:
-        qtnv_p = q.new_empty(z * h, d, s_q_pad // 2, dtype=torch.uint8)
+        qtnv_p = tp_alloc(z * h, d, s_q_pad // tp_div, dtype=torch.uint8)
         qtsc_p = (
-            q.new_empty(z * h, d, s_q_pad // 16, dtype=torch.uint8)
+            q.new_empty(z * h, d, s_q_pad // tsc_div, dtype=torch.uint8)
             if s_q_pad == s_q
-            else q.new_zeros(z * h, d, s_q_pad // 16, dtype=torch.uint8)
+            else q.new_zeros(z * h, d, s_q_pad // tsc_div, dtype=torch.uint8)
         )
-    dotnv_p = q.new_empty(z * h, d, s_q_pad // 2, dtype=torch.uint8)
+    dotnv_p = tp_alloc(z * h, d, s_q_pad // tp_div, dtype=torch.uint8)
     dotsc_p = (
-        q.new_empty(z * h, d, s_q_pad // 16, dtype=torch.uint8)
+        q.new_empty(z * h, d, s_q_pad // tsc_div, dtype=torch.uint8)
         if s_q_pad == s_q
-        else q.new_zeros(z * h, d, s_q_pad // 16, dtype=torch.uint8)
+        else q.new_zeros(z * h, d, s_q_pad // tsc_div, dtype=torch.uint8)
     )
+    if rn_do:
+        dorms = torch.empty(z * h, s_q, device=q.device, dtype=torch.float32)
+        if fp8:
+            dotrms = delta  # FP8 doT pack is e8m0 — no per-feature norm needed
+        else:
+            # GLOBAL per-feature rms of dO over the token axis (only a global
+            # per-d factor folds out of the dV GEMM, whose contraction spans
+            # all of Sq).
+            dotrms = do.to(torch.float32).square().mean(dim=1).sqrt()
+            dotrms = torch.where(dotrms == 0, torch.ones_like(dotrms), dotrms)
+            dotrms = dotrms.contiguous()
+    else:
+        dorms = delta  # unused dummy pointers (constexpr-disabled)
+        dotrms = delta
     _flash_bwd_packprep_kernel[(triton.cdiv(s_q, pp_block_m), z * h)](
         q,
         do,
@@ -3521,6 +3959,8 @@ def _run_bwd(
         dosc_p,
         dotnv_p,
         dotsc_p,
+        dorms,
+        dotrms,
         seed,
         s_q,
         s_q_pad,
@@ -3545,6 +3985,8 @@ def _run_bwd(
         STORE_DO=True,
         DO_ZSHD=do_zshd,
         O_ZSHD=o_zshd,
+        RN_DO=rn_do,
+        FP8_GRAD=fp8,
         BLOCK_M=pp_block_m,
         num_warps=8,
         num_stages=2,
@@ -3576,8 +4018,8 @@ def _run_bwd(
         ktnv_p = ktnv_saved.view(torch.uint8)
         ktsc_p = ktsc_saved
     else:
-        ktnv_p = k.new_empty(z * hk, d, s_kv_pad // 2, dtype=torch.uint8)
-        ktsc_p = k.new_empty(z * hk, d, s_kv_pad // 16, dtype=torch.uint8)
+        ktnv_p = k.new_empty(z * hk, d, s_kv_pad // tp_div, dtype=torch.uint8)
+        ktsc_p = k.new_empty(z * hk, d, s_kv_pad // tsc_div, dtype=torch.uint8)
     if not (reuse_k_pack and reuse_v_pack and reuse_kt_pack):
         _flash_bwd_kprep_kernel[(triton.cdiv(s_kv, kprep_block_n), z * hk)](
             k,
@@ -3597,6 +4039,7 @@ def _run_bwd(
             STORE_K=not reuse_k_pack,
             STORE_V=not reuse_v_pack,
             STORE_KT=not reuse_kt_pack,
+            FP8_KT=fp8,
             BLOCK_N=kprep_block_n,
             num_warps=dq_warps,
             num_stages=num_stages,
@@ -3619,10 +4062,14 @@ def _run_bwd(
         vnv_p,
         vsc_pv,
         bdummy,
+        seq_id,
+        seq_end,
         lse,
         delta,
         dk,
         dv,
+        dorms,
+        dotrms,
         scaling,
         seed,
         s_q,
@@ -3636,8 +4083,12 @@ def _run_bwd(
         sdv_n=dv.stride(1),
         HAS_BIAS=has_bias,
         CAUSAL=causal,
+        VARLEN=varlen,
         SR=sr,
         SR_P_DV=sr_p_dv,
+        RN=rn,
+        RN_DO=rn_do,
+        FP8=fp8,
         BLOCK_M=block_m,
         BLOCK_N=dkdv_block_n,
         num_warps=dkdv_warps,
@@ -3655,9 +4106,12 @@ def _run_bwd(
         vsc_pv,
         ktnv_p,
         ktsc_pv,
+        seq_id,
+        seq_start,
         lse,
         delta,
         dq,
+        dorms,
         scaling,
         seed,
         s_q,
@@ -3670,7 +4124,11 @@ def _run_bwd(
         sdq_n=dq.stride(1),
         HAS_BIAS=has_bias,
         CAUSAL=causal,
+        VARLEN=varlen,
         SR_DS_DQ=sr_ds_dq,
+        RN=rn,
+        RN_DO=rn_do,
+        FP8=fp8,
         BLOCK_M=dq_block_m,
         BLOCK_N=dq_block_n,
         num_warps=dq_warps,
@@ -3696,7 +4154,7 @@ class _NVFP4FlashAttn(torch.autograd.Function):
         backward_dot_dv_sr,
         backward_ds_dq_sr,
         dkdv_scratch_bf16,
-        backward_bf16_grad_dots,
+        backward_grad_dots,
         block_m,
         block_n,
         num_warps,
@@ -3716,19 +4174,21 @@ class _NVFP4FlashAttn(torch.autograd.Function):
         varlen = seq_id is not None
         varlen_arrays = (seq_id, seq_start, seq_end) if varlen else None
         if varlen:
-            # varlen routes the backward through _run_bwd_hp only; the legacy
-            # all-FP4 backward (_run_bwd) has no varlen support.
+            # the forward's saved-pack set is not varlen-aware; all four
+            # backward grad-dot modes themselves support varlen.
             assert not save_backward_packs, (
-                "varlen (cu_seqlens) is incompatible with save_backward_packs "
-                "(legacy all-FP4 backward); use the default hp backward"
+                "varlen (cu_seqlens) is incompatible with save_backward_packs"
             )
-            assert backward_bf16_grad_dots is not False, (
-                "varlen (cu_seqlens) requires the hp (bf16-grad-dots) backward; "
-                "do not pass backward_bf16_grad_dots=False"
-            )
-            assert num_key_value_groups <= 8, (
-                f"varlen backward needs GQA group <= 8 (hp dkdv unroll), got "
-                f"{num_key_value_groups}"
+        # backward_grad_dots arrives resolved from nvfp4_flash_attn_func; direct
+        # Function callers may still pass None (AUTO on s_kv) or a raw mode.
+        backward_grad_dots = _resolve_backward_grad_dots(
+            backward_grad_dots, s_kv, save_backward_packs, num_key_value_groups
+        )
+        if backward_grad_dots == "fp8_rownorm":
+            assert not save_backward_packs, (
+                "backward_grad_dots='fp8_rownorm' repacks Q^T/K^T as MXFP8; "
+                "incompatible with the saved forward FP4 transposed packs "
+                "(save_backward_packs)"
             )
         if save_backward_packs:
             assert q_packs_in is None and k_packs_in is None, (
@@ -3815,16 +4275,9 @@ class _NVFP4FlashAttn(torch.autograd.Function):
         )
         ctx.backward_ds_dq_sr = sr if backward_ds_dq_sr is None else backward_ds_dq_sr
         ctx.dkdv_scratch_bf16 = dkdv_scratch_bf16
-        # auto: hp-grad-dots needs the saved HP q/k/v, so it is incompatible
-        # with the packs-only saved set. Extreme MQA group sizes would unroll
-        # the in-kernel GQA accumulation loop too far — keep those on legacy.
-        if backward_bf16_grad_dots is None:
-            backward_bf16_grad_dots = not save_backward_packs
-        ctx.backward_bf16_grad_dots = (
-            backward_bf16_grad_dots
-            and not save_backward_packs
-            and num_key_value_groups <= 8
-        )
+        # resolved by _resolve_backward_grad_dots above ("bf16" needs the
+        # saved HP q/k/v and GQA group <= 8 — otherwise fp4_rownorm).
+        ctx.backward_grad_dots = backward_grad_dots
         ctx.tiles = (block_m, block_n, num_warps, num_stages)
         ctx.has_bias = bias is not None
         return out
@@ -3859,14 +4312,8 @@ class _NVFP4FlashAttn(torch.autograd.Function):
             # bias-dummy pointer — o satisfies that.
             q = k = v = o
         seq_arrays = getattr(ctx, "seq_arrays", None)
-        if seq_arrays is not None and not ctx.backward_bf16_grad_dots:
-            raise RuntimeError(
-                "varlen (cu_seqlens) backward is only implemented on the hp "
-                "(bf16-grad-dots) path; the legacy all-FP4 backward has no "
-                "varlen support"
-            )
         do = grad_out.reshape(z * h, s_q, d).contiguous()
-        if ctx.backward_bf16_grad_dots:
+        if ctx.backward_grad_dots == "bf16":
             dq, dk, dv = _run_bwd_hp(
                 q,
                 k,
@@ -3933,6 +4380,8 @@ class _NVFP4FlashAttn(torch.autograd.Function):
             vsc_saved=vdsc if vdsc.numel() else None,
             ktnv_saved=ktnv if ktnv.numel() else None,
             ktsc_saved=ktsc if ktsc.numel() else None,
+            grad_dots=ctx.backward_grad_dots,
+            seq_arrays=seq_arrays,
         )
         dq = dq.reshape(z, h, s_q, d).to(grad_out.dtype)
         ng = h // hk
@@ -3959,6 +4408,7 @@ def nvfp4_flash_attn_func(
     backward_dot_dv_stochastic_rounding: bool | None = None,
     backward_ds_dq_stochastic_rounding: bool | None = None,
     dkdv_scratch_bf16: bool | None = None,
+    backward_grad_dots: str | None = None,
     backward_bf16_grad_dots: bool | None = None,
     block_m: int = 64,
     block_n: int = 128,
@@ -3971,18 +4421,35 @@ def nvfp4_flash_attn_func(
 
     The forward runs fully as real 5th-gen FP4 ``tl.dot_scaled`` ops.
 
-    Backward, ``backward_bf16_grad_dots`` (None = auto):
-      * True (default when packs are not saved): the S/dP recomputes keep FP4
-        ``tl.dot_scaled`` with prepacked operands, but the three grad GEMMs
-        (dV, dK, dQ) run as bf16 ``tl.dot`` with exact P/dS — no per-iteration
-        quant or SR philox in the hot loops, no transposed packs, and GQA
-        dK/dV reduce in-kernel (no fp32 scratch planes). Faster and strictly
-        more accurate; the ``backward_*_stochastic_rounding`` and
-        ``dkdv_scratch_bf16`` knobs are moot on this path.
-      * False (and always when ``save_backward_packs=True``): the legacy
-        all-FP4 backward — all four grad GEMMs (dV, dP, dK, dQ) as FP4
-        ``tl.dot_scaled`` with gradient operands (P, dS, dO) quantized via
-        stochastic rounding per ``stochastic_rounding``.
+    Backward, ``backward_grad_dots`` (None = AUTO; see the module docstring's
+    BACKWARD GRAD-DOT MODES for the measured numbers):
+      * "bf16": the S/dP recomputes keep FP4 ``tl.dot_scaled`` with prepacked
+        operands, but the three grad GEMMs (dV, dK, dQ) run as bf16 ``tl.dot``
+        with exact P/dS — no per-iteration quant in the hot loops, no
+        transposed packs, GQA dK/dV reduce in-kernel. The most accurate mode
+        and the fastest below ~4k sequence; the
+        ``backward_*_stochastic_rounding`` and ``dkdv_scratch_bf16`` knobs are
+        moot on this path. Requires the saved hp q/k/v (not
+        ``save_backward_packs``) and GQA group <= 8; otherwise silently
+        downgraded to "fp4_rownorm".
+      * "fp4_rownorm": all-FP4 grad GEMMs with row-RMS-normalized gradient
+        operand packs (underflow-proof e4m3 scales). Matches the hp backward
+        on training quality and overtakes it in speed from ~4k seq up. RTN
+        only — the SR knobs are no-ops here (measured strictly worse).
+      * "fp8_rownorm": MXFP8 (e4m3 + e8m0 group-32) gradient-side GEMM
+        operands; the accuracy-leaning fp4-family option. RTN only.
+        Incompatible with ``save_backward_packs``.
+      * "fp4_legacy": the original all-FP4 backward — gradient operands
+        (P, dS, dO) packed plainly, ``stochastic_rounding`` and the per-GEMM
+        SR knobs honored.
+      * None (AUTO): "bf16" when the effective sequence (``s_kv``, or the
+        MEAN SAMPLE LENGTH under ``cu_seqlens`` varlen) is below 4096
+        (``_BWD_AUTO_FP4_MIN_SEQ``, the tunable crossover — fp4 grad dots only
+        beat the hp backward from ~4k up), else "fp4_rownorm". With
+        ``save_backward_packs=True``: "fp4_rownorm".
+
+    ``backward_bf16_grad_dots`` (bool) is a DEPRECATED alias:
+    True -> "bf16", False -> "fp4_legacy".
 
     q:[Z,H,Sq,D], k/v:[Z,Hk,Skv,D]; D in {128,256}; supports causal and GQA.
     Returns [Z,H,Sq,D] in query.dtype. ``dkdv_scratch_bf16=None`` auto-enables
@@ -3994,9 +4461,8 @@ def nvfp4_flash_attn_func(
     flattened into one Z=1 row: attention becomes block-diagonal causal, each
     sample attending only within itself, and per-block kv-loop bounds skip
     cross-sample tiles so work scales with sum(s_i^2) instead of S^2. Requires
-    ``causal=True``, ``Z == 1``, ``Sq == Skv``; the backward runs on the hp
-    (bf16-grad-dots) path (``save_backward_packs`` /
-    ``backward_bf16_grad_dots=False`` are rejected).
+    ``causal=True``, ``Z == 1``, ``Sq == Skv``. Works with every
+    ``backward_grad_dots`` mode (``save_backward_packs`` is rejected).
 
     ``q_packs`` / ``k_packs``: optional externally-produced FORWARD NVFP4 packs
     ``(packed uint8 [Z*H(or Z*Hk), S, D//2], scale e4m3 [..., S, D//16])`` in
@@ -4012,6 +4478,19 @@ def nvfp4_flash_attn_func(
     _, hk, s_kv, _ = key.shape
     assert h % hk == 0 and h // hk == num_key_value_groups
     assert d in (128, 256)
+    if backward_bf16_grad_dots is not None:
+        assert backward_grad_dots is None, (
+            "pass either backward_grad_dots or the deprecated "
+            "backward_bf16_grad_dots, not both"
+        )
+        backward_grad_dots = "bf16" if backward_bf16_grad_dots else "fp4_legacy"
+    if backward_grad_dots is None:
+        # AUTO: effective seq = s_kv, or the mean sample length under varlen
+        # (cu_seqlens is [nseq+1] — host metadata, no device sync).
+        eff_seq = s_kv if cu_seqlens is None else s_q / (cu_seqlens.numel() - 1)
+        backward_grad_dots = _resolve_backward_grad_dots(
+            None, eff_seq, save_backward_packs, num_key_value_groups
+        )
     if cu_seqlens is not None:
         assert causal, (
             "varlen (cu_seqlens) implements block-diagonal CAUSAL attention; "
@@ -4049,7 +4528,7 @@ def nvfp4_flash_attn_func(
         backward_dot_dv_stochastic_rounding,
         backward_ds_dq_stochastic_rounding,
         dkdv_scratch_bf16,
-        backward_bf16_grad_dots,
+        backward_grad_dots,
         block_m,
         block_n,
         num_warps,

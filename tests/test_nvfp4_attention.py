@@ -160,16 +160,20 @@ def test_forward_zshd_layout_matches_default():
 
 
 @pytest.mark.parametrize(
-    "bf16_grad_dots,dq_mode",
+    "grad_dots,dq_mode,cos_min",
     [
-        (True, None),
-        (True, "dscache"),
-        (True, "recompute"),
-        (True, "fused"),
-        (False, None),
+        ("bf16", None, 0.95),
+        ("bf16", "dscache", 0.95),
+        ("bf16", "recompute", 0.95),
+        ("bf16", "fused", 0.95),
+        # fp4_legacy: post-scale-underflow-fix level (dq/dk cos was ~0.91 at
+        # s2048 with the broken 2^-16 clamp; measured 0.970-0.986 here now).
+        ("fp4_legacy", None, 0.95),
+        ("fp4_rownorm", None, 0.95),
+        ("fp8_rownorm", None, 0.97),
     ],
 )
-def test_backward_sanity(bf16_grad_dots, dq_mode, monkeypatch):
+def test_backward_sanity(grad_dots, dq_mode, cos_min, monkeypatch):
     if dq_mode is not None:
         # exercise all hp dQ flavors: dS-cache GEMM, full recompute, and the
         # single-kernel atomic-dQ variant (env-only; auto never selects it)
@@ -194,13 +198,11 @@ def test_backward_sanity(bf16_grad_dots, dq_mode, monkeypatch):
     # With stochastic_rounding=True the per-element grads are unbiased but noisy,
     # so a single SR sample has low cos-sim by design (it averages to the
     # reference over steps — the convergence knob, not a per-step parity target).
-    # bf16_grad_dots=True is the default hp path; False covers the legacy
-    # all-FP4 backward (the save_backward_packs path).
     try:
         out = nvfp4_flash_attn_func(
             qf, kf, vf, scaling, causal=True, num_key_value_groups=1,
             stochastic_rounding=False,
-            backward_bf16_grad_dots=bf16_grad_dots,
+            backward_grad_dots=grad_dots,
         )
     except Exception as exc:  # noqa: BLE001
         _skip_if_unsupported(exc)
@@ -218,9 +220,12 @@ def test_backward_sanity(bf16_grad_dots, dq_mode, monkeypatch):
     ):
         assert g_fp4 is not None
         assert torch.isfinite(g_fp4).all()
-        assert _cos(g_fp4, g_ref) > 0.95
+        assert _cos(g_fp4, g_ref) > cos_min
 
-    # Stochastic rounding is unbiased: averaging samples converges to the ref.
+    if grad_dots != "fp4_legacy":
+        return
+    # Stochastic rounding (honored on fp4_legacy only; the rownorm modes force
+    # RTN) is unbiased: averaging samples converges to the ref.
     grad_acc = [torch.zeros_like(qr.grad), torch.zeros_like(kr.grad), torch.zeros_like(vr.grad)]
     n_samples = 16
     for _ in range(n_samples):
@@ -229,7 +234,7 @@ def test_backward_sanity(bf16_grad_dots, dq_mode, monkeypatch):
         vs = v.clone().requires_grad_(True)
         o = nvfp4_flash_attn_func(
             qs, ks, vs, scaling, causal=True, num_key_value_groups=1,
-            stochastic_rounding=True,
+            stochastic_rounding=True, backward_grad_dots="fp4_legacy",
         )
         o.backward(grad)
         for acc, g in zip(grad_acc, (qs.grad, ks.grad, vs.grad)):
@@ -569,14 +574,237 @@ def test_varlen_rejects_bad_args():
         k2 = torch.randn(2, h, s, d, device="cuda", dtype=torch.bfloat16)
         v2 = torch.randn(2, h, s, d, device="cuda", dtype=torch.bfloat16)
         nvfp4_flash_attn_func(q2, k2, v2, sm, causal=True, cu_seqlens=cu)
-    with pytest.raises(AssertionError, match="hp"):
-        nvfp4_flash_attn_func(
-            q, k, v, sm, causal=True, cu_seqlens=cu, backward_bf16_grad_dots=False
-        )
     with pytest.raises(AssertionError, match="save_backward_packs"):
         nvfp4_flash_attn_func(
             q, k, v, sm, causal=True, cu_seqlens=cu, save_backward_packs=True
         )
+    with pytest.raises(ValueError, match="backward_grad_dots"):
+        nvfp4_flash_attn_func(
+            q, k, v, sm, causal=True, cu_seqlens=cu, backward_grad_dots="bogus"
+        )
+    with pytest.raises(AssertionError, match="not both"):
+        nvfp4_flash_attn_func(
+            q, k, v, sm, causal=True, cu_seqlens=cu,
+            backward_grad_dots="bf16", backward_bf16_grad_dots=True,
+        )
+    with pytest.raises(AssertionError, match="fp8_rownorm"):
+        nvfp4_flash_attn_func(
+            q, k, v, sm, causal=True,
+            backward_grad_dots="fp8_rownorm", save_backward_packs=True,
+        )
+
+
+# ---------------------------------------------------------------------------
+# VARLEN x fp4/fp8 grad-dot modes: the all-FP4 backward kernels carry the same
+# block-diagonal masks/bounds as the hp kernels (the rownorm productization
+# added VARLEN to _flash_bwd_dkdv_kernel/_flash_bwd_dq_kernel).
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("grad_dots", ["fp4_legacy", "fp4_rownorm", "fp8_rownorm"])
+def test_varlen_grad_dots_modes_parity(grad_dots):
+    torch.manual_seed(0)
+    lens = _varlen_lens("ragged_2048")
+    s = sum(lens)
+    z, h, hk, d = 1, 32, 8, 128
+    groups = h // hk
+    scaling = 1.0 / math.sqrt(d)
+    cu = _varlen_cu(lens)
+
+    q = torch.randn(z, h, s, d, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(z, hk, s, d, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(z, hk, s, d, device="cuda", dtype=torch.bfloat16)
+    grad = torch.randn_like(q)
+
+    _, dq_ref, dk_ref, dv_ref = _varlen_ref(q, k, v, lens, scaling, groups, grad)
+
+    qf = q.clone().requires_grad_(True)
+    kf = k.clone().requires_grad_(True)
+    vf = v.clone().requires_grad_(True)
+    try:
+        out = nvfp4_flash_attn_func(
+            qf, kf, vf, scaling, causal=True, num_key_value_groups=groups,
+            cu_seqlens=cu, stochastic_rounding=False,
+            backward_grad_dots=grad_dots,
+        )
+    except Exception as exc:  # noqa: BLE001
+        _skip_if_unsupported(exc)
+    out.backward(grad)
+
+    cos_min = 0.97 if grad_dots == "fp8_rownorm" else 0.95
+    for g_fp4, g_ref in ((qf.grad, dq_ref), (kf.grad, dk_ref), (vf.grad, dv_ref)):
+        assert g_fp4 is not None
+        assert torch.isfinite(g_fp4).all()
+        assert _cos(g_fp4, g_ref) > cos_min
+
+
+# ---------------------------------------------------------------------------
+# Scale-underflow regression. The NVFP4 group scale is STORED as e4m3; the old
+# clamp floor (2^-16) is below e4m3's representable range, so any group with
+# amax < ~6e-3 got a scale of EXACTLY 0 (clamped value rounds to 0 in the cast)
+# and silently exited the GEMM. The fix floors at e4m3's min subnormal (2^-9).
+# ---------------------------------------------------------------------------
+def test_scale_underflow_regression():
+    from sageattention.nvfp4 import _quant_nvfp4
+
+    torch.manual_seed(5)
+    # (1) a tiny-amplitude (1e-6) tensor packs with NONZERO, finite scales
+    # (pre-fix: every scale byte was exactly 0).
+    x = torch.randn(2, 64, 128, device="cuda", dtype=torch.bfloat16) * 1e-6
+    try:
+        _, qsc = _quant_nvfp4(x)
+    except Exception as exc:  # noqa: BLE001
+        _skip_if_unsupported(exc)
+    qsc = qsc.float()
+    assert torch.isfinite(qsc).all()
+    assert (qsc > 0).all(), "tiny-amplitude pack produced zero e4m3 scales"
+    assert qsc.min().item() == 2**-9  # the e4m3 min-subnormal floor
+
+    # (2) a tiny-amplitude (1e-6) gradient round-trips through the backward
+    # grad packs into USEFUL grads on the productized rownorm modes (their
+    # packs are amplitude-invariant by construction); the post-fix legacy
+    # mode is exercised in the amax-rescue band (amplitude 1.0, covered by
+    # test_backward_sanity — a global 1e-6 amplitude is below what ANY fixed
+    # e4m3 scale floor can represent, which is exactly why rownorm exists).
+    z, h, s, d = 1, 4, 128, 128
+    scaling = 1.0 / math.sqrt(d)
+    q = torch.randn(z, h, s, d, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(z, h, s, d, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(z, h, s, d, device="cuda", dtype=torch.bfloat16)
+    grad = torch.randn(z, h, s, d, device="cuda", dtype=torch.bfloat16) * 1e-6
+
+    qr = q.clone().requires_grad_(True)
+    kr = k.clone().requires_grad_(True)
+    vr = v.clone().requires_grad_(True)
+    F.scaled_dot_product_attention(
+        qr, kr, vr, is_causal=True, scale=scaling
+    ).backward(grad)
+
+    for mode in ("fp4_rownorm", "fp8_rownorm"):
+        qf = q.clone().requires_grad_(True)
+        kf = k.clone().requires_grad_(True)
+        vf = v.clone().requires_grad_(True)
+        nvfp4_flash_attn_func(
+            qf, kf, vf, scaling, causal=True, num_key_value_groups=1,
+            stochastic_rounding=False, backward_grad_dots=mode,
+        ).backward(grad)
+        for g, g_ref in ((qf.grad, qr.grad), (kf.grad, kr.grad), (vf.grad, vr.grad)):
+            assert torch.isfinite(g).all()
+            assert g.abs().max().item() > 0, f"{mode}: tiny-grad backward is dead"
+            assert _cos(g, g_ref) > 0.9, f"{mode}: tiny-grad cos collapsed"
+
+
+# ---------------------------------------------------------------------------
+# AUTO gate: backward_grad_dots=None picks "bf16" below 4096 effective seq
+# (s_kv, or the MEAN SAMPLE LENGTH under varlen) and "fp4_rownorm" at/above.
+# ---------------------------------------------------------------------------
+def test_backward_grad_dots_auto_resolver():
+    from sageattention.nvfp4.flash import (
+        _BWD_AUTO_FP4_MIN_SEQ,
+        _resolve_backward_grad_dots,
+    )
+
+    assert _BWD_AUTO_FP4_MIN_SEQ == 4096
+    assert _resolve_backward_grad_dots(None, 2048, False, 4) == "bf16"
+    assert _resolve_backward_grad_dots(None, 4095, False, 4) == "bf16"
+    assert _resolve_backward_grad_dots(None, 4096, False, 4) == "fp4_rownorm"
+    assert _resolve_backward_grad_dots(None, 8192, False, 4) == "fp4_rownorm"
+    # bf16 needs saved hp q/k/v and GQA group <= 8 — silent downgrade
+    assert _resolve_backward_grad_dots(None, 512, True, 1) == "fp4_rownorm"
+    assert _resolve_backward_grad_dots("bf16", 512, True, 1) == "fp4_rownorm"
+    assert _resolve_backward_grad_dots("bf16", 512, False, 16) == "fp4_rownorm"
+    # explicit modes pass through
+    assert _resolve_backward_grad_dots("fp4_legacy", 512, False, 4) == "fp4_legacy"
+    assert _resolve_backward_grad_dots("fp8_rownorm", 9999, False, 4) == "fp8_rownorm"
+    with pytest.raises(ValueError, match="backward_grad_dots"):
+        _resolve_backward_grad_dots("fp4", 512, False, 4)
+
+
+def test_backward_grad_dots_auto_gate_e2e(monkeypatch):
+    import sageattention.nvfp4.flash as flash_mod
+
+    calls = []
+    real_hp, real_fp4 = flash_mod._run_bwd_hp, flash_mod._run_bwd
+
+    def spy_hp(*a, **kw):
+        calls.append("bf16")
+        return real_hp(*a, **kw)
+
+    def spy_fp4(*a, **kw):
+        calls.append(kw.get("grad_dots", "fp4_legacy"))
+        return real_fp4(*a, **kw)
+
+    monkeypatch.setattr(flash_mod, "_run_bwd_hp", spy_hp)
+    monkeypatch.setattr(flash_mod, "_run_bwd", spy_fp4)
+
+    torch.manual_seed(0)
+    d = 128
+    scaling = 1.0 / math.sqrt(d)
+
+    def run(s, cu=None, **kw):
+        q = torch.randn(1, 2, s, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        k = torch.randn(1, 2, s, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        v = torch.randn(1, 2, s, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        out = nvfp4_flash_attn_func(
+            q, k, v, scaling, causal=True, num_key_value_groups=1,
+            cu_seqlens=cu, stochastic_rounding=False, **kw,
+        )
+        out.backward(torch.randn_like(out))
+        for g in (q.grad, k.grad, v.grad):
+            assert g is not None and torch.isfinite(g).all()
+
+    try:
+        run(256)  # dense below the gate -> bf16
+    except Exception as exc:  # noqa: BLE001
+        _skip_if_unsupported(exc)
+    assert calls[-1] == "bf16"
+
+    run(4096)  # dense at the gate -> fp4_rownorm
+    assert calls[-1] == "fp4_rownorm"
+
+    # varlen: S=4608 > 4096 but MEAN sample length 512 -> still bf16
+    cu = torch.tensor([0] + [512 * i for i in range(1, 10)], dtype=torch.int32)
+    run(4608, cu=cu)
+    assert calls[-1] == "bf16"
+
+
+def test_backward_bf16_grad_dots_deprecated_alias(monkeypatch):
+    """backward_bf16_grad_dots=True -> "bf16", False -> "fp4_legacy"."""
+    import sageattention.nvfp4.flash as flash_mod
+
+    calls = []
+    real_hp, real_fp4 = flash_mod._run_bwd_hp, flash_mod._run_bwd
+
+    def spy_hp(*a, **kw):
+        calls.append("bf16")
+        return real_hp(*a, **kw)
+
+    def spy_fp4(*a, **kw):
+        calls.append(kw.get("grad_dots", "fp4_legacy"))
+        return real_fp4(*a, **kw)
+
+    monkeypatch.setattr(flash_mod, "_run_bwd_hp", spy_hp)
+    monkeypatch.setattr(flash_mod, "_run_bwd", spy_fp4)
+
+    torch.manual_seed(0)
+    z, h, s, d = 1, 2, 128, 128
+    scaling = 1.0 / math.sqrt(d)
+
+    def run(alias):
+        q = torch.randn(z, h, s, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        k = torch.randn(z, h, s, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        v = torch.randn(z, h, s, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        out = nvfp4_flash_attn_func(
+            q, k, v, scaling, causal=True, num_key_value_groups=1,
+            stochastic_rounding=False, backward_bf16_grad_dots=alias,
+        )
+        out.backward(torch.randn_like(out))
+
+    try:
+        run(True)
+    except Exception as exc:  # noqa: BLE001
+        _skip_if_unsupported(exc)
+    assert calls[-1] == "bf16"
+    run(False)
+    assert calls[-1] == "fp4_legacy"
 
 
 @pytest.mark.parametrize("d", [128, 256])
