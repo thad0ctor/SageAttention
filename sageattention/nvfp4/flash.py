@@ -830,6 +830,25 @@ _FWD_TILE = {
 }
 _FWD_TILE_DEFAULT = (64, 128, 8, 3)
 
+# VARLEN (packed-sequence) forward tiles. Packed training batches are many short
+# samples (~hundreds of tokens) flattened into one row: with the dense tiles a
+# 256-token sample spans only 2-4 q-blocks and much of each 128-wide kv tile is
+# ragged-boundary (masked) waste. Swept the full (block_m, block_n, warps,
+# stages) grid at packed-8192 means {256,1024,2048}, d256 h16/4 and d128 h32/8
+# (RTX PRO 6000, Triton 3.7.0, fwd wall incl. quant prologue):
+#   d256: (32,64,4,3) wins at every mean — 0.273/0.424/0.627 ms vs the dense
+#         tile's 0.281/0.440/0.664 (smaller tiles cut ragged waste AND raise
+#         occupancy across many short samples).
+#   d128: (128,128,8,3) is never worse than the dense default —
+#         0.265/0.372/0.536 vs 0.265/0.378/0.541 (one more stage; geometry was
+#         already near-optimal).
+# Explicit caller tiles are honored as-is (the sweep harness / autotune path).
+# Older-Triton fallbacks mirror _FWD_TILE's square-operand-safe choices.
+_FWD_TILE_VARLEN = {
+    256: (32, 64, 4, 3),
+    128: (128, 128, 8, 3) if _FP4_SQUARE_OK else (64, 64, 8, 3),
+}
+
 # Below this seqlen the forward pre-quant is launch/overhead bound, so folding the
 # three Q/K/V quant launches into one (`_quant_qkv_fwd`) wins. Above it, V's
 # in-kernel key loop under-parallelizes vs three separate grids, so we revert to
@@ -837,13 +856,15 @@ _FWD_TILE_DEFAULT = (64, 128, 8, 3)
 _FWD_FUSED_QUANT_MAX_SEQ = 3072
 
 
-def _resolve_fwd_tiles(d, block_m, block_n, num_warps, num_stages):
+def _resolve_fwd_tiles(d, block_m, block_n, num_warps, num_stages, varlen=False):
     """Pick head_dim-tuned forward tiles when the caller left the generic defaults.
 
+    ``varlen=True`` selects the packed-sequence tile set (``_FWD_TILE_VARLEN``).
     Explicit non-default tiles are honored as-is (autotune / manual override).
     """
     if (block_m, block_n, num_warps, num_stages) == _FWD_TILE_DEFAULT:
-        return _FWD_TILE.get(d, _FWD_TILE_DEFAULT)
+        table = _FWD_TILE_VARLEN if varlen else _FWD_TILE
+        return table.get(d, _FWD_TILE_DEFAULT)
     return block_m, block_n, num_warps, num_stages
 
 
@@ -2279,7 +2300,16 @@ def nvfp4_flash_attention_packed(
         if varlen_arrays is None:
             varlen_arrays = _varlen_seq_arrays(cu_seqlens, s_q, qnv.device)
     block_m, block_n, num_warps, num_stages = _resolve_fwd_tiles(
-        d, block_m, block_n, num_warps, num_stages
+        d, block_m, block_n, num_warps, num_stages, varlen=varlen_arrays is not None
+    )
+    # The caller padded V's key axis to ITS block_n (the public default, 128);
+    # the resolved kernel block_n must still divide that padding (the V^T loads
+    # are unmasked and start_n-aligned). 64 divides 128, so the varlen tile set
+    # is safe; guard against future tile choices breaking the contract.
+    s_kv_pad_in = vnv.shape[-1] * 2
+    assert s_kv_pad_in % block_n == 0, (
+        f"V pack padded to {s_kv_pad_in} is not a multiple of the resolved "
+        f"forward block_n={block_n}"
     )
     out_zshd = out_layout == "zshd"
     if out_zshd:
@@ -2331,6 +2361,8 @@ def nvfp4_flash_attention(
     return_lse: bool = False,
     return_packs: bool = False,
     out_layout: str = "zhsd",
+    q_packs: tuple[torch.Tensor, torch.Tensor] | None = None,
+    k_packs: tuple[torch.Tensor, torch.Tensor] | None = None,
     _varlen_arrays: tuple | None = None,
 ):
     """Fused native-NVFP4 flash attention, forward only.
@@ -2356,6 +2388,16 @@ def nvfp4_flash_attention(
         out_layout:
           * ``"zhsd"`` (default): returns ``[Z, H, Sq, D]``.
           * ``"zshd"``: returns ``[Z, Sq, H, D]`` written directly by the kernel.
+        q_packs / k_packs: optional EXTERNALLY-PRODUCED forward NVFP4 packs
+            ``(packed uint8 [Z*H(or Z*Hk), S, D//2], scale e4m3 [..., S, D//16])``
+            in the along-D ``_quant_nvfp4`` layout (e.g. from a fused RoPE+quant
+            producer). When given, the corresponding internal forward pre-quant
+            launch is SKIPPED — the high-precision tensor is still required (it
+            sizes the output and, on the autograd path, feeds the backward,
+            which repacks from HP exactly as before). V is always quantized
+            here (key-axis layout depends on block_n). Incompatible with
+            ``return_packs`` (whose backward pack set must be derived from the
+            same fused HP read).
 
     Returns:
         Attention output in ``query.dtype`` (and the LSE tensor if ``return_lse``).
@@ -2381,7 +2423,7 @@ def nvfp4_flash_attention(
     varlen = varlen_arrays is not None
     user_tiles = (block_m, block_n, num_warps, num_stages) != _FWD_TILE_DEFAULT
     block_m, block_n, num_warps, num_stages = _resolve_fwd_tiles(
-        d, block_m, block_n, num_warps, num_stages
+        d, block_m, block_n, num_warps, num_stages, varlen=varlen
     )
     # (Removed a short-non-causal d=128 perf special that forced block_m=128: at
     # D=128 block_m==D makes the FP4 dot_scaled operand square -> wrong (cos ~0.31).
@@ -2412,6 +2454,11 @@ def nvfp4_flash_attention(
     s_kv_pad = _next_mult(s_kv, block_n)
     packs = None
     if return_packs:
+        assert q_packs is None and k_packs is None, (
+            "q_packs/k_packs (externally-produced forward packs) are "
+            "incompatible with return_packs (the backward pack set is derived "
+            "from the same fused HP read as the forward packs)"
+        )
         # Fuse each operand's two pack layouts into ONE read of the source. Q/K emit
         # {along-D (fwd), along-M (bwd)}; V emits {along-D (bwd), along-key^T (fwd)} —
         # V's forward V^T is layout B (along the key axis, padded to s_kv_pad).
@@ -2422,6 +2469,37 @@ def nvfp4_flash_attention(
         knv, ksc, ktnv, ktsc = _quant_nvfp4_dual(k2, s_kv_bwd_pad)
         vdnv, vdsc, vnv, vsc = _quant_nvfp4_dual(v2, s_kv_pad)
         packs = (qnv, qsc, qtnv, qtsc, knv, ksc, vdnv, vdsc, ktnv, ktsc)
+    elif q_packs is not None or k_packs is not None:
+        # Externally-produced forward Q/K packs (fused RoPE+quant producers):
+        # skip the corresponding internal pre-quant launches. Only V (whose
+        # key-axis pack layout depends on block_n) is quantized here.
+        if q_packs is not None:
+            qnv, qsc = q_packs
+            assert qnv.shape == (z * h, s_q, d // 2) and qsc.shape == (
+                z * h,
+                s_q,
+                d // 16,
+            ), (
+                f"q_packs layout mismatch: expected packed {(z * h, s_q, d // 2)} "
+                f"/ scale {(z * h, s_q, d // 16)}, got {tuple(qnv.shape)} / "
+                f"{tuple(qsc.shape)}"
+            )
+        else:
+            qnv, qsc = _quant_nvfp4(q2)
+        if k_packs is not None:
+            knv, ksc = k_packs
+            assert knv.shape == (z * hk, s_kv, d // 2) and ksc.shape == (
+                z * hk,
+                s_kv,
+                d // 16,
+            ), (
+                f"k_packs layout mismatch: expected packed {(z * hk, s_kv, d // 2)} "
+                f"/ scale {(z * hk, s_kv, d // 16)}, got {tuple(knv.shape)} / "
+                f"{tuple(ksc.shape)}"
+            )
+        else:
+            knv, ksc = _quant_nvfp4(k2)
+        vnv, vsc = _quant_nvfp4(v2, transpose=True, k_pad=s_kv_pad)
     elif s_q <= _FWD_FUSED_QUANT_MAX_SEQ and s_kv <= _FWD_FUSED_QUANT_MAX_SEQ:
         # Single fused launch for Q/K/V pre-quant (folds 3 launches into 1). At
         # short seqlen the per-launch overhead dominated; this is a win there and
@@ -3626,9 +3704,15 @@ class _NVFP4FlashAttn(torch.autograd.Function):
         seq_id,
         seq_start,
         seq_end,
+        qnv_in,
+        qsc_in,
+        knv_in,
+        ksc_in,
     ):
         z, h, s_q, d = query.shape
         _, hk, s_kv, _ = key.shape
+        q_packs_in = (qnv_in, qsc_in) if qnv_in is not None else None
+        k_packs_in = (knv_in, ksc_in) if knv_in is not None else None
         varlen = seq_id is not None
         varlen_arrays = (seq_id, seq_start, seq_end) if varlen else None
         if varlen:
@@ -3647,6 +3731,10 @@ class _NVFP4FlashAttn(torch.autograd.Function):
                 f"{num_key_value_groups}"
             )
         if save_backward_packs:
+            assert q_packs_in is None and k_packs_in is None, (
+                "q_packs/k_packs are incompatible with save_backward_packs "
+                "(the saved pack set must come from the same fused HP read)"
+            )
             out, lse, packs = nvfp4_flash_attention(
                 query,
                 key,
@@ -3677,6 +3765,8 @@ class _NVFP4FlashAttn(torch.autograd.Function):
                 num_warps=num_warps,
                 num_stages=num_stages,
                 return_lse=True,
+                q_packs=q_packs_in,
+                k_packs=k_packs_in,
                 _varlen_arrays=varlen_arrays,
             )
             qnv = qsc = qtnv = qtsc = knv = ksc = vdnv = vdsc = ktnv = ktsc = (
@@ -3800,7 +3890,7 @@ class _NVFP4FlashAttn(torch.autograd.Function):
                 dq.reshape(z, h, s_q, d),
                 dk.reshape(z, hk, s_kv, d),
                 dv.reshape(z, hk, s_kv, d),
-            ) + (None,) * 18
+            ) + (None,) * 22
         dkdv_scratch_bf16 = ctx.dkdv_scratch_bf16
         if dkdv_scratch_bf16 is None:
             # With no GQA reduction, each scratch element is only downcast once before
@@ -3851,7 +3941,7 @@ class _NVFP4FlashAttn(torch.autograd.Function):
         else:
             dk = dk.reshape(z, hk, s_kv, d).to(grad_out.dtype)
             dv = dv.reshape(z, hk, s_kv, d).to(grad_out.dtype)
-        return (dq, dk, dv) + (None,) * 18
+        return (dq, dk, dv) + (None,) * 22
 
 
 def nvfp4_flash_attn_func(
@@ -3874,6 +3964,8 @@ def nvfp4_flash_attn_func(
     block_n: int = 128,
     num_warps: int = 8,
     num_stages: int = 3,
+    q_packs: tuple[torch.Tensor, torch.Tensor] | None = None,
+    k_packs: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Native-NVFP4 flash attention with a differentiable native-NVFP4 backward.
 
@@ -3905,6 +3997,16 @@ def nvfp4_flash_attn_func(
     ``causal=True``, ``Z == 1``, ``Sq == Skv``; the backward runs on the hp
     (bf16-grad-dots) path (``save_backward_packs`` /
     ``backward_bf16_grad_dots=False`` are rejected).
+
+    ``q_packs`` / ``k_packs``: optional externally-produced FORWARD NVFP4 packs
+    ``(packed uint8 [Z*H(or Z*Hk), S, D//2], scale e4m3 [..., S, D//16])`` in
+    the along-D ``_quant_nvfp4`` layout (e.g. from a fused RoPE+quant
+    producer). They skip the matching forward pre-quant launches ONLY; the
+    high-precision ``query``/``key`` (already roped, matching the packs) are
+    still saved and the BACKWARD repacks from them exactly as without packs —
+    grads are bit-identical to the no-packs call when the packs equal
+    ``_quant_nvfp4`` of the HP operand. Incompatible with
+    ``save_backward_packs``.
     """
     z, h, s_q, d = query.shape
     _, hk, s_kv, _ = key.shape
@@ -3926,6 +4028,13 @@ def nvfp4_flash_attn_func(
         )
     else:
         seq_id = seq_start = seq_end = None
+    if q_packs is not None or k_packs is not None:
+        assert not save_backward_packs, (
+            "q_packs/k_packs are incompatible with save_backward_packs "
+            "(the saved pack set must come from the same fused HP read)"
+        )
+    qnv_in, qsc_in = q_packs if q_packs is not None else (None, None)
+    knv_in, ksc_in = k_packs if k_packs is not None else (None, None)
     return _NVFP4FlashAttn.apply(
         query,
         key,
@@ -3948,4 +4057,8 @@ def nvfp4_flash_attn_func(
         seq_id,
         seq_start,
         seq_end,
+        qnv_in,
+        qsc_in,
+        knv_in,
+        ksc_in,
     )

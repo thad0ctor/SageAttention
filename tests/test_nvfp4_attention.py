@@ -369,12 +369,15 @@ def test_varlen_dq_modes(dq_mode, monkeypatch):
 
 def test_varlen_single_sample_matches_dense():
     """cu_seqlens=[0, S] is exactly dense causal — must match bit-for-bit
-    (the VARLEN masks/bounds are no-ops there, value-identical ops)."""
+    (the VARLEN masks/bounds are no-ops there, value-identical ops). Explicit
+    identical tiles on both runs: the varlen DEFAULT tile set is tuned
+    separately (different accumulation tiling is value-different fp32 math)."""
     torch.manual_seed(3)
     z, h, hk, s, d = 1, 8, 2, 1029, 128  # non-multiple S stresses padded tiles
     groups = h // hk
     scaling = 1.0 / math.sqrt(d)
     cu = torch.tensor([0, s], dtype=torch.int32)
+    tiles = dict(block_m=64, block_n=64, num_warps=8, num_stages=3)
 
     q = torch.randn(z, h, s, d, device="cuda", dtype=torch.bfloat16)
     k = torch.randn(z, hk, s, d, device="cuda", dtype=torch.bfloat16)
@@ -387,7 +390,7 @@ def test_varlen_single_sample_matches_dense():
         vf = v.clone().requires_grad_(True)
         out = nvfp4_flash_attn_func(
             qf, kf, vf, scaling, causal=True, num_key_value_groups=groups,
-            cu_seqlens=cu_, stochastic_rounding=False,
+            cu_seqlens=cu_, stochastic_rounding=False, **tiles,
         )
         out.backward(grad)
         return out.detach(), qf.grad, kf.grad, vf.grad
@@ -403,10 +406,11 @@ def test_varlen_single_sample_matches_dense():
 
     # fwd-only API takes cu_seqlens too
     out_fwd = nvfp4_flash_attention(
-        q, k, v, scaling, causal=True, num_key_value_groups=groups, cu_seqlens=cu
+        q, k, v, scaling, causal=True, num_key_value_groups=groups, cu_seqlens=cu,
+        **tiles,
     )
     out_dense = nvfp4_flash_attention(
-        q, k, v, scaling, causal=True, num_key_value_groups=groups
+        q, k, v, scaling, causal=True, num_key_value_groups=groups, **tiles,
     )
     assert torch.equal(out_fwd, out_dense)
 
@@ -471,6 +475,78 @@ def test_varlen_packed_operands_match_in_kernel_quant(d):
         nvfp4_flash_attention_packed(
             qnv, qsc, knv, ksc, vnv, vsc, cu_seqlens=cu,
             **{**common, "causal": False},
+        )
+
+
+@pytest.mark.parametrize("d", [128, 256])
+def test_varlen_prepacked_qk_training_bit_identical(d):
+    """``nvfp4_flash_attn_func(..., q_packs=, k_packs=)`` — externally-produced
+    forward q/k packs through the TRAINING entry — is bit-identical (out AND
+    all grads) to the no-packs call: the packs only skip the forward pre-quant,
+    the backward repacks from the saved hp exactly as before."""
+    from sageattention.nvfp4 import _quant_nvfp4
+
+    torch.manual_seed(21 + d)
+    lens = [256, 96, 320, 256, 100, 252]  # ragged, straddles tile boundaries
+    s = sum(lens)
+    z, h, hk = 1, 4, 2
+    groups = h // hk
+    scaling = 1.0 / math.sqrt(d)
+    cu = _varlen_cu(lens)
+
+    q = torch.randn(z, h, s, d, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(z, hk, s, d, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(z, hk, s, d, device="cuda", dtype=torch.bfloat16)
+    grad = torch.randn_like(q)
+
+    def run(q_packs=None, k_packs=None, cu_=cu):
+        qf = q.clone().requires_grad_(True)
+        kf = k.clone().requires_grad_(True)
+        vf = v.clone().requires_grad_(True)
+        out = nvfp4_flash_attn_func(
+            qf, kf, vf, scaling, causal=True, num_key_value_groups=groups,
+            cu_seqlens=cu_, stochastic_rounding=False,
+            q_packs=q_packs, k_packs=k_packs,
+        )
+        out.backward(grad)
+        return out.detach(), qf.grad, kf.grad, vf.grad
+
+    qp = _quant_nvfp4(q.reshape(z * h, s, d))
+    kp = _quant_nvfp4(k.reshape(z * hk, s, d))
+    try:
+        base = run()
+        packed = run(qp, kp)
+        q_only = run(q_packs=qp)  # partial: k still quantized in the forward
+    except Exception as exc:  # noqa: BLE001
+        _skip_if_unsupported(exc)
+    for name, a, b in zip(("out", "dq", "dk", "dv"), base, packed):
+        assert torch.equal(a, b), f"prepacked-q/k {name} not bit-identical"
+    for name, a, b in zip(("out", "dq", "dk", "dv"), base, q_only):
+        assert torch.equal(a, b), f"prepacked-q-only {name} not bit-identical"
+
+    # DENSE (no cu_seqlens) prepacked forward works identically too.
+    try:
+        dense_base = run(cu_=None)
+        dense_packed = run(qp, kp, cu_=None)
+    except Exception as exc:  # noqa: BLE001
+        _skip_if_unsupported(exc)
+    for name, a, b in zip(("out", "dq", "dk", "dv"), dense_base, dense_packed):
+        assert torch.equal(a, b), f"dense prepacked {name} not bit-identical"
+
+    # save_backward_packs is mutually exclusive (the saved pack set must come
+    # from the same fused HP read).
+    with pytest.raises(AssertionError, match="save_backward_packs"):
+        nvfp4_flash_attn_func(
+            q.clone().requires_grad_(True), k, v, scaling, causal=True,
+            num_key_value_groups=groups, save_backward_packs=True, q_packs=qp,
+        )
+
+    # layout mismatch fails loud (not garbage output).
+    bad = (qp[0][:, : s // 2], qp[1][:, : s // 2])
+    with pytest.raises(AssertionError, match="q_packs layout"):
+        nvfp4_flash_attn_func(
+            q.clone().requires_grad_(True), k, v, scaling, causal=True,
+            num_key_value_groups=groups, cu_seqlens=cu, q_packs=bad,
         )
 
 
