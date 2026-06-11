@@ -781,12 +781,19 @@ def _varlen_seq_arrays(
       * ``seq_end``:   one past the last token of that token's sample (dkdv m-loop
         hi bound)
 
-    Validation copies cu_seqlens to host once per call (it is tiny); the arrays
-    themselves are built with searchsorted + gather, no further syncs.
+    The host-copy validation is a device sync and packed training calls this
+    once PER LAYER per step, so the result is CACHED on the cu_seqlens tensor
+    itself, keyed by (s, device, _version): all decoder layers of a step share
+    the same cu_seqlens tensor, so the sync + searchsorted run once per step
+    instead of once per layer (8 stalls -> 1 on a Qwen3.5 hybrid).
     """
     assert cu_seqlens.ndim == 1 and cu_seqlens.numel() >= 2, (
         f"cu_seqlens must be a 1-D [nseq+1] tensor, got shape {tuple(cu_seqlens.shape)}"
     )
+    cache_key = (int(s), str(device), cu_seqlens._version)
+    cached = getattr(cu_seqlens, "_nvfp4_seq_arrays", None)
+    if cached is not None and cached[0] == cache_key:
+        return cached[1]
     cu = cu_seqlens.detach().to("cpu", torch.int64)
     assert int(cu[0]) == 0, f"cu_seqlens[0] must be 0, got {int(cu[0])}"
     assert int(cu[-1]) == s, (
@@ -798,7 +805,12 @@ def _varlen_seq_arrays(
     seq_id = (torch.searchsorted(cud, pos, right=True) - 1).to(torch.int32)
     seq_start = cud[seq_id.long()].contiguous()
     seq_end = cud[seq_id.long() + 1].contiguous()
-    return seq_id, seq_start, seq_end
+    arrays = (seq_id, seq_start, seq_end)
+    try:
+        cu_seqlens._nvfp4_seq_arrays = (cache_key, arrays)
+    except (AttributeError, RuntimeError):
+        pass  # exotic tensor subclasses that forbid attributes: just rebuild
+    return arrays
 
 
 # Triton < 3.7 mis-lowers an FP4 tl.dot_scaled when a tile dim equals head_dim D:
