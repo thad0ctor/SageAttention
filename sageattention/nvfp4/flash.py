@@ -574,6 +574,8 @@ def _flash_fwd_kernel(
     vnv_ptr,
     vsc_ptr,  # [Z*Hk, D, Skv//2], [Z*Hk, D, Skv//16]  (V^T, quant on key)
     bias_ptr,  # [Z, Skv] fp32 additive key-pad bias, or 0
+    seqid_ptr,  # VARLEN: [Sq] int32 per-token sample index (packed varlen)
+    seqstart_ptr,  # VARLEN: [Sq] int32 first token index of each token's sample
     out_ptr,  # [Z*H, Sq, D] (default) or [Z, Sq, H, D] (OUT_ZSHD)
     lse_ptr,  # [Z*H, Sq] fp32 logsumexp, written iff STORE_LSE
     scaling,
@@ -594,6 +596,7 @@ def _flash_fwd_kernel(
     so_h,  # out z / head strides, used only when OUT_ZSHD
     HAS_BIAS: tl.constexpr,
     CAUSAL: tl.constexpr,
+    VARLEN: tl.constexpr,  # packed varlen: block-diagonal-causal over samples
     STORE_LSE: tl.constexpr,
     OUT_ZSHD: tl.constexpr,  # store the [Z, Sq, H, D] layout directly (no transpose+copy)
     BLOCK_M: tl.constexpr,
@@ -628,6 +631,14 @@ def _flash_fwd_kernel(
         other=0,
     ).to(tl.float8e4nv, bitcast=True)
 
+    if VARLEN:
+        # Per-token sample id/start for this q tile. Clamped index: padded rows
+        # (offs_m >= Sq) behave like the last valid row — they stay finite and
+        # are discarded by the store mask, and they don't drag the lo bound.
+        idx_m = tl.minimum(offs_m, Sq - 1)
+        seq_id_q = tl.load(seqid_ptr + idx_m)
+        seq_start_q = tl.load(seqstart_ptr + idx_m)
+
     m_i = tl.full((BLOCK_M,), _NEG_INF, dtype=tl.float32)
     l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
     acc = tl.zeros((BLOCK_M, D), dtype=tl.float32)
@@ -648,8 +659,15 @@ def _flash_fwd_kernel(
         hi = tl.minimum(Skv, (pid_m * BLOCK_M + BLOCK_M) + (Skv - Sq))
     else:
         hi = Skv
+    if VARLEN:
+        # Block-diagonal: no query in this tile attends keys before the earliest
+        # sample start. Align DOWN to BLOCK_N — the V^T loads below are unmasked
+        # and rely on BLOCK_N-aligned start_n (V padded to a BLOCK_N multiple).
+        lo = (tl.min(seq_start_q) // BLOCK_N) * BLOCK_N
+    else:
+        lo = 0
 
-    for start_n in range(0, hi, BLOCK_N):
+    for start_n in range(lo, hi, BLOCK_N):
         offs_n = start_n + offs_n0
         nmask = offs_n < Skv
         # load packed K tile [BLOCK_N, D//2] + scale [BLOCK_N, D//16]
@@ -674,11 +692,27 @@ def _flash_fwd_kernel(
         if CAUSAL:
             causal_ok = offs_n[None, :] <= (offs_m[:, None] + (Skv - Sq))
             s = tl.where(causal_ok, s, _NEG_INF)
+        if VARLEN:
+            # block-diagonal mask: tokens attend only within their own sample.
+            # The backward recompute kernels apply this EXACT predicate so the
+            # forward LSE stays consistent.
+            seq_id_k = tl.load(seqid_ptr + tl.minimum(offs_n, Skv - 1))
+            same_seq = seq_id_q[:, None] == seq_id_k[None, :]
+            s = tl.where(same_seq, s, _NEG_INF)
 
         # online softmax
         m_new = tl.maximum(m_i, tl.max(s, axis=1))
-        alpha = tl.exp(m_i - m_new)
-        p = tl.exp(s - m_new[:, None])  # [BLOCK_M, BLOCK_N], >=0
+        if VARLEN:
+            # A row whose sample starts after this kv tile is fully masked
+            # (m_new == -inf): exp(-inf - -inf) would NaN-poison l_i/acc. Guard
+            # like the bwd prep kernel; alpha=0 then multiplies an empty
+            # (l_i=0, acc=0) history, so it's exact. Dense keeps the original
+            # expression bit-identically (constexpr-pruned).
+            m_sf = tl.where(m_new == _NEG_INF, 0.0, m_new)
+        else:
+            m_sf = m_new
+        alpha = tl.exp(m_i - m_sf)
+        p = tl.exp(s - m_sf[:, None])  # [BLOCK_M, BLOCK_N], >=0
         l_i = l_i * alpha + tl.sum(p, axis=1)
         acc = acc * alpha[:, None]
 
@@ -730,6 +764,41 @@ def _flash_fwd_kernel(
 
 def _next_mult(n: int, m: int) -> int:
     return ((n + m - 1) // m) * m
+
+
+def _varlen_seq_arrays(
+    cu_seqlens: torch.Tensor, s: int, device
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Expand FA-varlen ``cu_seqlens`` into per-token sample-boundary arrays.
+
+    ``cu_seqlens``: int [nseq+1], FlashAttention varlen convention — sample i
+    occupies tokens ``[cu[i], cu[i+1])`` of the flattened length-``s`` row
+    (``cu[0] == 0``, ``cu[-1] == s``, nondecreasing).
+
+    Returns three int32 ``[s]`` device arrays consumed by the VARLEN kernels:
+      * ``seq_id``:    sample index of each token (block-diagonal mask predicate)
+      * ``seq_start``: first token index of that token's sample (kv-loop lo bound)
+      * ``seq_end``:   one past the last token of that token's sample (dkdv m-loop
+        hi bound)
+
+    Validation copies cu_seqlens to host once per call (it is tiny); the arrays
+    themselves are built with searchsorted + gather, no further syncs.
+    """
+    assert cu_seqlens.ndim == 1 and cu_seqlens.numel() >= 2, (
+        f"cu_seqlens must be a 1-D [nseq+1] tensor, got shape {tuple(cu_seqlens.shape)}"
+    )
+    cu = cu_seqlens.detach().to("cpu", torch.int64)
+    assert int(cu[0]) == 0, f"cu_seqlens[0] must be 0, got {int(cu[0])}"
+    assert int(cu[-1]) == s, (
+        f"cu_seqlens[-1] ({int(cu[-1])}) must equal the packed seqlen ({s})"
+    )
+    assert bool((cu[1:] >= cu[:-1]).all()), "cu_seqlens must be nondecreasing"
+    cud = cu.to(device=device, dtype=torch.int32)
+    pos = torch.arange(s, device=device, dtype=torch.int32)
+    seq_id = (torch.searchsorted(cud, pos, right=True) - 1).to(torch.int32)
+    seq_start = cud[seq_id.long()].contiguous()
+    seq_end = cud[seq_id.long() + 1].contiguous()
+    return seq_id, seq_start, seq_end
 
 
 # Triton < 3.7 mis-lowers an FP4 tl.dot_scaled when a tile dim equals head_dim D:
@@ -1509,6 +1578,8 @@ def _flash_bwd_dkdv_hp_kernel(
     k_ptr,
     v_ptr,
     bias_ptr,
+    seqid_ptr,  # VARLEN: [S] int32 per-token sample index (Sq == Skv)
+    seqend_ptr,  # VARLEN: [S] int32 one-past-sample-end of each token
     lse_ptr,
     delta_ptr,
     dk_ptr,
@@ -1535,6 +1606,7 @@ def _flash_bwd_dkdv_hp_kernel(
     DO_ZSHD: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     CAUSAL: tl.constexpr,
+    VARLEN: tl.constexpr,
     STORE_DS: tl.constexpr,
     ATOMIC_DQ: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -1589,11 +1661,21 @@ def _flash_bwd_dkdv_hp_kernel(
         lo = tl.maximum(((pid_n * BLOCK_N - (Skv - Sq)) // BLOCK_M) * BLOCK_M, 0)
     else:
         lo = 0
+    if VARLEN:
+        # Block-diagonal-causal m bounds for this key tile. lo: causal already
+        # gives aligned(n-tile start) and every key satisfies n >= seq_start(n),
+        # so the causal lo dominates aligned(min seq_start) — no extra clamp.
+        # hi: no query past the LAST sample's end attends any key here.
+        idx_n = tl.minimum(offs_n, Skv - 1)
+        seq_id_k = tl.load(seqid_ptr + idx_n)
+        hi_m = tl.max(tl.load(seqend_ptr + idx_n))
+    else:
+        hi_m = Sq
 
     for g in tl.static_range(GPP):
         zh = z * H + hq0 + g
         h = hq0 + g
-        for start_m in range(lo, Sq, BLOCK_M):
+        for start_m in range(lo, hi_m, BLOCK_M):
             offs_m = start_m + tl.arange(0, BLOCK_M)
             mmask = offs_m < Sq
             qnv = tl.load(
@@ -1620,6 +1702,12 @@ def _flash_bwd_dkdv_hp_kernel(
             if CAUSAL:
                 causal_ok = offs_n[:, None] <= (offs_m[None, :] + (Skv - Sq))
                 sT = tl.where(causal_ok, sT, _NEG_INF)
+            if VARLEN:
+                # same block-diagonal predicate as the forward (transposed
+                # frame), so pT = exp(sT - lse) matches the forward softmax.
+                seq_id_q = tl.load(seqid_ptr + tl.minimum(offs_m, Sq - 1))
+                same_seq = seq_id_k[:, None] == seq_id_q[None, :]
+                sT = tl.where(same_seq, sT, _NEG_INF)
             pT = tl.exp(sT - lse[None, :])
             pT = tl.where(sT == _NEG_INF, 0.0, pT)
 
@@ -1721,6 +1809,8 @@ def _flash_bwd_dq_hp_kernel(
     knv_ptr,
     ksc_ptr,
     bias_ptr,
+    seqid_ptr,  # VARLEN: [S] int32 per-token sample index
+    seqstart_ptr,  # VARLEN: [S] int32 first token index of each token's sample
     lse_ptr,
     delta_ptr,
     dq_ptr,
@@ -1741,6 +1831,7 @@ def _flash_bwd_dq_hp_kernel(
     DO_ZSHD: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     CAUSAL: tl.constexpr,
+    VARLEN: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
@@ -1753,6 +1844,10 @@ def _flash_bwd_dq_hp_kernel(
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, D)
     mmask = offs_m < Sq
+    if VARLEN:
+        idx_m = tl.minimum(offs_m, Sq - 1)
+        seq_id_q = tl.load(seqid_ptr + idx_m)
+        seq_start_q = tl.load(seqstart_ptr + idx_m)
 
     DP2: tl.constexpr = D // 2
     DP16: tl.constexpr = D // 16
@@ -1793,8 +1888,13 @@ def _flash_bwd_dq_hp_kernel(
         hi = tl.minimum(Skv, (pid_m * BLOCK_M + BLOCK_M) + (Skv - Sq))
     else:
         hi = Skv
+    if VARLEN:
+        # block-diagonal: skip key tiles before this tile's earliest sample.
+        lo = (tl.min(seq_start_q) // BLOCK_N) * BLOCK_N
+    else:
+        lo = 0
 
-    for start_n in range(0, hi, BLOCK_N):
+    for start_n in range(lo, hi, BLOCK_N):
         offs_n = start_n + tl.arange(0, BLOCK_N)
         nmask = offs_n < Skv
         knv = tl.load(
@@ -1816,6 +1916,11 @@ def _flash_bwd_dq_hp_kernel(
         if CAUSAL:
             causal_ok = offs_n[None, :] <= (offs_m[:, None] + (Skv - Sq))
             s = tl.where(causal_ok, s, _NEG_INF)
+        if VARLEN:
+            # same block-diagonal predicate as the forward, consistent with lse
+            seq_id_k = tl.load(seqid_ptr + tl.minimum(offs_n, Skv - 1))
+            same_seq = seq_id_q[:, None] == seq_id_k[None, :]
+            s = tl.where(same_seq, s, _NEG_INF)
         p = tl.exp(s - lse[:, None])
         p = tl.where(s == _NEG_INF, 0.0, p)
 
@@ -1856,6 +1961,8 @@ def _flash_bwd_dq_hp_kernel(
 def _flash_bwd_dq_dscache_kernel(
     dst_ptr,
     k_ptr,
+    seqid_ptr,  # VARLEN: [S] int32 per-token sample index
+    seqstart_ptr,  # VARLEN: [S] int32 first token index of each token's sample
     dq_ptr,
     Sq,
     Skv,
@@ -1865,6 +1972,7 @@ def _flash_bwd_dq_dscache_kernel(
     H: tl.constexpr,
     HK: tl.constexpr,
     CAUSAL: tl.constexpr,
+    VARLEN: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
@@ -1883,8 +1991,16 @@ def _flash_bwd_dq_dscache_kernel(
         hi = tl.minimum(Skv, (pid_m * BLOCK_M + BLOCK_M) + (Skv - Sq))
     else:
         hi = Skv
+    if VARLEN:
+        # block-diagonal: keys before this tile's earliest sample start are
+        # never attended; the dS^T plane is unwritten there. Align down.
+        idx_m = tl.minimum(offs_m, Sq - 1)
+        seq_id_q = tl.load(seqid_ptr + idx_m)
+        lo = (tl.min(tl.load(seqstart_ptr + idx_m)) // BLOCK_N) * BLOCK_N
+    else:
+        lo = 0
 
-    for start_n in range(0, hi, BLOCK_N):
+    for start_n in range(lo, hi, BLOCK_N):
         offs_n = start_n + tl.arange(0, BLOCK_N)
         nmask = offs_n < Skv
         # cached dS^T plane is [Z*H, Skv, Sq]; read the [m, n] tile transposed
@@ -1896,6 +2012,13 @@ def _flash_bwd_dq_dscache_kernel(
         if CAUSAL:
             causal_ok = offs_n[None, :] <= (offs_m[:, None] + (Skv - Sq))
             ds = tl.where(causal_ok, ds, 0.0)
+        if VARLEN:
+            # re-mask cross-sample positions: the dkdv writer never visits
+            # them inside its [lo, hi_m) bounds, so the plane holds garbage
+            # there (same pattern as the causal re-mask above).
+            seq_id_k = tl.load(seqid_ptr + tl.minimum(offs_n, Skv - 1))
+            same_seq = seq_id_q[:, None] == seq_id_k[None, :]
+            ds = tl.where(same_seq, ds, 0.0)
         k_t = tl.load(
             k_ptr + zhk * (Skv * sk_n) + offs_n[:, None] * sk_n + offs_d[None, :],
             mask=nmask[:, None],
@@ -2033,6 +2156,8 @@ def _run_flash_packed(
         vnv_v,
         vsc_v,
         bias if bias is not None else qnv_v,
+        qnv_v,  # dummy seqid ptr (VARLEN=False)
+        qnv_v,  # dummy seqstart ptr (VARLEN=False)
         out,
         out,  # dummy lse ptr (STORE_LSE=False)
         scaling,
@@ -2053,6 +2178,7 @@ def _run_flash_packed(
         so_h=out.stride(2) if out_zshd else 0,
         HAS_BIAS=bias is not None,
         CAUSAL=causal,
+        VARLEN=False,
         STORE_LSE=False,
         OUT_ZSHD=out_zshd,
         BLOCK_M=block_m,
@@ -2149,6 +2275,7 @@ def nvfp4_flash_attention(
     causal: bool = False,
     num_key_value_groups: int = 1,
     key_pad_bias: torch.Tensor | None = None,
+    cu_seqlens: torch.Tensor | None = None,
     block_m: int = 64,
     block_n: int = 128,
     num_warps: int = 8,
@@ -2156,6 +2283,7 @@ def nvfp4_flash_attention(
     return_lse: bool = False,
     return_packs: bool = False,
     out_layout: str = "zhsd",
+    _varlen_arrays: tuple | None = None,
 ):
     """Fused native-NVFP4 flash attention, forward only.
 
@@ -2167,6 +2295,12 @@ def nvfp4_flash_attention(
         num_key_value_groups: ``H // Hk``.
         key_pad_bias: optional ``[Z, Skv]`` additive bias on the key axis
             (0 for real tokens, -inf for padding), broadcast over heads/queries.
+        cu_seqlens: optional int ``[nseq+1]`` cumulative sample boundaries
+            (FA-varlen convention) for PACKED sequences flattened into one row:
+            attention becomes block-diagonal causal (each sample attends only
+            within itself). Requires ``causal=True``, ``Z == 1`` and
+            ``Sq == Skv``. Per-q-block kv loops start at the sample start, so
+            packed work scales with sum(s_i^2), not S^2.
         block_m, block_n: flash tile sizes.
         return_lse: also return the per-row logsumexp ``[Z*H, Sq]`` (fp32) so the
             backward can skip recomputing it (the FA2 backward prep's QK^T pass).
@@ -2182,6 +2316,21 @@ def nvfp4_flash_attention(
     _, hk, s_kv, _ = key.shape
     assert h % hk == 0 and h // hk == num_key_value_groups
     assert d % 16 == 0 and d in (128, 256)
+    varlen_arrays = _varlen_arrays
+    if cu_seqlens is not None or varlen_arrays is not None:
+        assert causal, (
+            "varlen (cu_seqlens) implements block-diagonal CAUSAL attention; "
+            "pass causal=True"
+        )
+        assert z == 1, (
+            f"varlen packs all samples into one flattened row: Z must be 1, got Z={z}"
+        )
+        assert s_q == s_kv, (
+            f"varlen requires packed self-attention (Sq == Skv), got {s_q} vs {s_kv}"
+        )
+        if varlen_arrays is None:
+            varlen_arrays = _varlen_seq_arrays(cu_seqlens, s_q, query.device)
+    varlen = varlen_arrays is not None
     user_tiles = (block_m, block_n, num_warps, num_stages) != _FWD_TILE_DEFAULT
     block_m, block_n, num_warps, num_stages = _resolve_fwd_tiles(
         d, block_m, block_n, num_warps, num_stages
@@ -2258,6 +2407,8 @@ def nvfp4_flash_attention(
     ksc_v = ksc.view(torch.uint8)
     vsc_v = vsc.view(torch.uint8)
 
+    seq_id, seq_start = (varlen_arrays[0], varlen_arrays[1]) if varlen else (qnv_v, qnv_v)
+
     grid = (triton.cdiv(s_q, block_m), z * h)
 
     def _run():
@@ -2269,6 +2420,8 @@ def nvfp4_flash_attention(
             vnv_v,
             vsc_v,
             bias if bias is not None else qnv_v,  # dummy ptr when no bias
+            seq_id,  # dummy ptr when not varlen
+            seq_start,
             out,
             lse,
             scaling,
@@ -2289,6 +2442,7 @@ def nvfp4_flash_attention(
             so_h=out.stride(2) if out_zshd else 0,
             HAS_BIAS=bias is not None,
             CAUSAL=causal,
+            VARLEN=varlen,
             STORE_LSE=return_lse,
             OUT_ZSHD=out_zshd,
             BLOCK_M=block_m,
@@ -2709,10 +2863,16 @@ def _run_bwd_hp(
     do_zshd=False,
     o_zshd=False,
     out_dtype=None,
+    seq_arrays=None,
 ):
     """HP-grad-dots backward. The S/dP recomputes keep FP4 ``tl.dot_scaled``
     (consistent with the forward LSE, packs prepacked once); the three grad
     GEMMs (dV, dK, dQ) run as bf16 ``tl.dot`` with EXACT pT/dS operands.
+
+    ``seq_arrays``: optional ``(seq_id, seq_start, seq_end)`` int32 [S] device
+    arrays from ``_varlen_seq_arrays`` — enables packed-varlen (block-diagonal
+    causal) masking + loop bounds; the forward must have run with the same
+    arrays (the lse was computed under that mask). Requires causal.
 
     vs. the all-FP4 ``_run_bwd``: no per-iteration quant packs or SR philox in
     the hot loops (their dominant ALU cost), no transposed Q^T/dO^T/K^T packs
@@ -2728,6 +2888,12 @@ def _run_bwd_hp(
     assert lse is not None
     out_dtype = out_dtype or do.dtype
     ng = h // hk
+    varlen = seq_arrays is not None
+    if varlen:
+        assert causal, "varlen backward requires causal=True"
+        seq_id, seq_start, seq_end = seq_arrays
+    else:
+        seq_id = seq_start = seq_end = q  # dummy ptrs (VARLEN=False prunes loads)
 
     delta = torch.empty(z * h, s_q, device=q.device, dtype=torch.float32)
     dk = torch.empty(z * hk, s_kv, d, device=q.device, dtype=out_dtype)
@@ -2782,6 +2948,10 @@ def _run_bwd_hp(
     #                sm_120/Triton 3.7 — red.global.add contention serializes
     #                it to 0.25-0.65x — kept env-selectable for future stacks,
     #                never auto-selected. Nondeterministic accumulation order.
+    # NOTE(varlen): for packed-varlen inputs the dS^T plane is mostly zeros /
+    # never-visited (only the block-diagonal samples carry data), so ds_bytes
+    # overstates the useful cache ~ (S / mean_sample_len)x and a tighter,
+    # sum(s_i * S)-aware gate (or a compacted per-sample plane) is future work.
     ds_bytes = z * h * s_kv * s_q * 2
     ds_cap = int(os.environ.get("NVFP4_DS_CACHE_MAX_MB", "1536")) * 2**20
     if d >= 256:
@@ -2923,6 +3093,8 @@ def _run_bwd_hp(
         k,
         v,
         bdummy,
+        seq_id,
+        seq_end,
         lse,
         delta,
         dk,
@@ -2949,6 +3121,7 @@ def _run_bwd_hp(
         DO_ZSHD=do_zshd,
         HAS_BIAS=has_bias,
         CAUSAL=causal,
+        VARLEN=varlen,
         STORE_DS=dq_mode == "dscache",
         ATOMIC_DQ=dq_mode == "fused",
         BLOCK_M=dkdv_block_m,
@@ -2963,6 +3136,8 @@ def _run_bwd_hp(
         _flash_bwd_dq_dscache_kernel[(triton.cdiv(s_q, dqc_block_m), z * h)](
             dst_p,
             k,
+            seq_id,
+            seq_start,
             dq,
             s_q,
             s_kv,
@@ -2972,6 +3147,7 @@ def _run_bwd_hp(
             H=h,
             HK=hk,
             CAUSAL=causal,
+            VARLEN=varlen,
             BLOCK_M=dqc_block_m,
             BLOCK_N=dqc_block_n,
             num_warps=dqc_warps,
@@ -2987,6 +3163,8 @@ def _run_bwd_hp(
             knv_p,
             ksc_pv,
             bdummy,
+            seq_id,
+            seq_start,
             lse,
             delta,
             dq,
@@ -3007,6 +3185,7 @@ def _run_bwd_hp(
             DO_ZSHD=do_zshd,
             HAS_BIAS=has_bias,
             CAUSAL=causal,
+            VARLEN=varlen,
             BLOCK_M=dq_block_m,
             BLOCK_N=dq_block_n,
             num_warps=dq_warps,
@@ -3396,9 +3575,29 @@ class _NVFP4FlashAttn(torch.autograd.Function):
         block_n,
         num_warps,
         num_stages,
+        seq_id,
+        seq_start,
+        seq_end,
     ):
         z, h, s_q, d = query.shape
         _, hk, s_kv, _ = key.shape
+        varlen = seq_id is not None
+        varlen_arrays = (seq_id, seq_start, seq_end) if varlen else None
+        if varlen:
+            # varlen routes the backward through _run_bwd_hp only; the legacy
+            # all-FP4 backward (_run_bwd) has no varlen support.
+            assert not save_backward_packs, (
+                "varlen (cu_seqlens) is incompatible with save_backward_packs "
+                "(legacy all-FP4 backward); use the default hp backward"
+            )
+            assert backward_bf16_grad_dots is not False, (
+                "varlen (cu_seqlens) requires the hp (bf16-grad-dots) backward; "
+                "do not pass backward_bf16_grad_dots=False"
+            )
+            assert num_key_value_groups <= 8, (
+                f"varlen backward needs GQA group <= 8 (hp dkdv unroll), got "
+                f"{num_key_value_groups}"
+            )
         if save_backward_packs:
             out, lse, packs = nvfp4_flash_attention(
                 query,
@@ -3430,6 +3629,7 @@ class _NVFP4FlashAttn(torch.autograd.Function):
                 num_warps=num_warps,
                 num_stages=num_stages,
                 return_lse=True,
+                _varlen_arrays=varlen_arrays,
             )
             qnv = qsc = qtnv = qtsc = knv = ksc = vdnv = vdsc = ktnv = ktsc = (
                 torch.empty(0, device=query.device)
@@ -3469,6 +3669,7 @@ class _NVFP4FlashAttn(torch.autograd.Function):
         ctx.dims = (z, h, hk, s_q, s_kv, d)
         ctx.scaling = scaling
         ctx.causal = causal
+        ctx.seq_arrays = varlen_arrays  # tiny [S] int32 x3; fine to keep on ctx
         ctx.sr = sr
         ctx.backward_p_dv_sr = sr if backward_p_dv_sr is None else backward_p_dv_sr
         ctx.backward_dot_dv_sr = (
@@ -3519,6 +3720,13 @@ class _NVFP4FlashAttn(torch.autograd.Function):
             # [z*h,s_q,d] shape/device/stride for scratch allocs and the unused
             # bias-dummy pointer — o satisfies that.
             q = k = v = o
+        seq_arrays = getattr(ctx, "seq_arrays", None)
+        if seq_arrays is not None and not ctx.backward_bf16_grad_dots:
+            raise RuntimeError(
+                "varlen (cu_seqlens) backward is only implemented on the hp "
+                "(bf16-grad-dots) path; the legacy all-FP4 backward has no "
+                "varlen support"
+            )
         do = grad_out.reshape(z * h, s_q, d).contiguous()
         if ctx.backward_bf16_grad_dots:
             dq, dk, dv = _run_bwd_hp(
@@ -3538,27 +3746,13 @@ class _NVFP4FlashAttn(torch.autograd.Function):
                 ctx.causal,
                 lse,
                 out_dtype=grad_out.dtype,
+                seq_arrays=seq_arrays,
             )
             return (
                 dq.reshape(z, h, s_q, d),
                 dk.reshape(z, hk, s_kv, d),
                 dv.reshape(z, hk, s_kv, d),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            ) + (None,) * 18
         dkdv_scratch_bf16 = ctx.dkdv_scratch_bf16
         if dkdv_scratch_bf16 is None:
             # With no GQA reduction, each scratch element is only downcast once before
@@ -3609,26 +3803,7 @@ class _NVFP4FlashAttn(torch.autograd.Function):
         else:
             dk = dk.reshape(z, hk, s_kv, d).to(grad_out.dtype)
             dv = dv.reshape(z, hk, s_kv, d).to(grad_out.dtype)
-        return (
-            dq,
-            dk,
-            dv,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
+        return (dq, dk, dv) + (None,) * 18
 
 
 def nvfp4_flash_attn_func(
@@ -3639,6 +3814,7 @@ def nvfp4_flash_attn_func(
     causal: bool = False,
     num_key_value_groups: int = 1,
     key_pad_bias: torch.Tensor | None = None,
+    cu_seqlens: torch.Tensor | None = None,
     stochastic_rounding: bool = True,
     save_backward_packs: bool = False,
     backward_p_dv_stochastic_rounding: bool | None = None,
@@ -3672,11 +3848,36 @@ def nvfp4_flash_attn_func(
     Returns [Z,H,Sq,D] in query.dtype. ``dkdv_scratch_bf16=None`` auto-enables
     bf16 dQ/dK/dV scratch only for no-GQA bf16 backward, where it is
     bit-identical to fp32 scratch plus the final cast.
+
+    ``cu_seqlens``: optional int ``[nseq+1]`` cumulative sample boundaries
+    (FA-varlen convention) for PACKED sequences (e.g. axolotl sample packing)
+    flattened into one Z=1 row: attention becomes block-diagonal causal, each
+    sample attending only within itself, and per-block kv-loop bounds skip
+    cross-sample tiles so work scales with sum(s_i^2) instead of S^2. Requires
+    ``causal=True``, ``Z == 1``, ``Sq == Skv``; the backward runs on the hp
+    (bf16-grad-dots) path (``save_backward_packs`` /
+    ``backward_bf16_grad_dots=False`` are rejected).
     """
     z, h, s_q, d = query.shape
     _, hk, s_kv, _ = key.shape
     assert h % hk == 0 and h // hk == num_key_value_groups
     assert d in (128, 256)
+    if cu_seqlens is not None:
+        assert causal, (
+            "varlen (cu_seqlens) implements block-diagonal CAUSAL attention; "
+            "pass causal=True"
+        )
+        assert z == 1, (
+            f"varlen packs all samples into one flattened row: Z must be 1, got Z={z}"
+        )
+        assert s_q == s_kv, (
+            f"varlen requires packed self-attention (Sq == Skv), got {s_q} vs {s_kv}"
+        )
+        seq_id, seq_start, seq_end = _varlen_seq_arrays(
+            cu_seqlens, s_q, query.device
+        )
+    else:
+        seq_id = seq_start = seq_end = None
     return _NVFP4FlashAttn.apply(
         query,
         key,
@@ -3696,4 +3897,7 @@ def nvfp4_flash_attn_func(
         block_n,
         num_warps,
         num_stages,
+        seq_id,
+        seq_start,
+        seq_end,
     )

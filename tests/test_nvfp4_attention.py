@@ -239,6 +239,207 @@ def test_backward_sanity(bf16_grad_dots, dq_mode, monkeypatch):
         assert _cos(acc / n_samples, g_ref) > 0.95
 
 
+# ---------------------------------------------------------------------------
+# VARLEN (packed-sequence, block-diagonal causal) parity. Reference = per-sample
+# loop of SDPA over the same packed tensor slices (each sample attends only
+# within itself). Sample lengths deliberately straddle tile boundaries and
+# include samples smaller than a tile (the classic off-by-one territory).
+# ---------------------------------------------------------------------------
+_VARLEN_LENS = {
+    # ragged, straddles 64/128 tile boundaries, includes a sub-tile sample
+    "ragged_2048": [37, 256, 1024, 731],
+    # the production shape: ~30 samples of 200-400 tokens packed into 8192
+    "packed_8192": None,  # generated below (seeded)
+}
+
+
+def _varlen_lens(case: str) -> list[int]:
+    lens = _VARLEN_LENS[case]
+    if lens is None:
+        g = torch.Generator().manual_seed(42)
+        lens, total = [], 8192
+        while sum(lens) < total - 400:
+            lens.append(int(torch.randint(200, 401, (1,), generator=g)))
+        lens.append(total - sum(lens))
+    return lens
+
+
+def _varlen_cu(lens: list[int]) -> torch.Tensor:
+    return torch.tensor(
+        [0] + torch.tensor(lens).cumsum(0).tolist(), dtype=torch.int32
+    )
+
+
+def _varlen_ref(q, k, v, lens, scaling, groups, grad=None):
+    """Per-sample SDPA loop over the packed row; returns (out, dq, dk, dv)."""
+    qr = q.clone().requires_grad_(grad is not None)
+    kr = k.clone().requires_grad_(grad is not None)
+    vr = v.clone().requires_grad_(grad is not None)
+    krep = kr.repeat_interleave(groups, dim=1)
+    vrep = vr.repeat_interleave(groups, dim=1)
+    outs, a = [], 0
+    for L in lens:
+        b = a + L
+        outs.append(
+            F.scaled_dot_product_attention(
+                qr[:, :, a:b], krep[:, :, a:b], vrep[:, :, a:b],
+                is_causal=True, scale=scaling,
+            )
+        )
+        a = b
+    ref = torch.cat(outs, dim=2)
+    if grad is None:
+        return ref, None, None, None
+    ref.backward(grad)
+    return ref.detach(), qr.grad, kr.grad, vr.grad
+
+
+@pytest.mark.parametrize("h,hk,d", [(32, 8, 128), (16, 4, 256)])
+@pytest.mark.parametrize("lens_case", ["ragged_2048", "packed_8192"])
+def test_varlen_parity(lens_case, h, hk, d):
+    torch.manual_seed(0)
+    lens = _varlen_lens(lens_case)
+    s = sum(lens)
+    z, groups = 1, h // hk
+    scaling = 1.0 / math.sqrt(d)
+    cu = _varlen_cu(lens)
+
+    q = torch.randn(z, h, s, d, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(z, hk, s, d, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(z, hk, s, d, device="cuda", dtype=torch.bfloat16)
+    grad = torch.randn_like(q)
+
+    ref, dq_ref, dk_ref, dv_ref = _varlen_ref(q, k, v, lens, scaling, groups, grad)
+
+    qf = q.clone().requires_grad_(True)
+    kf = k.clone().requires_grad_(True)
+    vf = v.clone().requires_grad_(True)
+    try:
+        out = nvfp4_flash_attn_func(
+            qf, kf, vf, scaling, causal=True, num_key_value_groups=groups,
+            cu_seqlens=cu, stochastic_rounding=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        _skip_if_unsupported(exc)
+    out.backward(grad)
+
+    assert out.shape == ref.shape
+    assert torch.isfinite(out).all()
+    assert _cos(out, ref) > 0.95
+    for g_fp4, g_ref in ((qf.grad, dq_ref), (kf.grad, dk_ref), (vf.grad, dv_ref)):
+        assert g_fp4 is not None
+        assert torch.isfinite(g_fp4).all()
+        assert _cos(g_fp4, g_ref) > 0.95
+
+
+@pytest.mark.parametrize("dq_mode", ["dscache", "recompute"])
+def test_varlen_dq_modes(dq_mode, monkeypatch):
+    monkeypatch.setenv("NVFP4_BWD_DQ_MODE", dq_mode)
+    torch.manual_seed(0)
+    lens = _varlen_lens("ragged_2048")
+    s = sum(lens)
+    z, h, hk, d = 1, 32, 8, 128
+    groups = h // hk
+    scaling = 1.0 / math.sqrt(d)
+    cu = _varlen_cu(lens)
+
+    q = torch.randn(z, h, s, d, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(z, hk, s, d, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(z, hk, s, d, device="cuda", dtype=torch.bfloat16)
+    grad = torch.randn_like(q)
+
+    _, dq_ref, dk_ref, dv_ref = _varlen_ref(q, k, v, lens, scaling, groups, grad)
+
+    qf = q.clone().requires_grad_(True)
+    kf = k.clone().requires_grad_(True)
+    vf = v.clone().requires_grad_(True)
+    try:
+        out = nvfp4_flash_attn_func(
+            qf, kf, vf, scaling, causal=True, num_key_value_groups=groups,
+            cu_seqlens=cu, stochastic_rounding=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        _skip_if_unsupported(exc)
+    out.backward(grad)
+
+    for g_fp4, g_ref in ((qf.grad, dq_ref), (kf.grad, dk_ref), (vf.grad, dv_ref)):
+        assert torch.isfinite(g_fp4).all()
+        assert _cos(g_fp4, g_ref) > 0.95
+
+
+def test_varlen_single_sample_matches_dense():
+    """cu_seqlens=[0, S] is exactly dense causal — must match bit-for-bit
+    (the VARLEN masks/bounds are no-ops there, value-identical ops)."""
+    torch.manual_seed(3)
+    z, h, hk, s, d = 1, 8, 2, 1029, 128  # non-multiple S stresses padded tiles
+    groups = h // hk
+    scaling = 1.0 / math.sqrt(d)
+    cu = torch.tensor([0, s], dtype=torch.int32)
+
+    q = torch.randn(z, h, s, d, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(z, hk, s, d, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(z, hk, s, d, device="cuda", dtype=torch.bfloat16)
+    grad = torch.randn_like(q)
+
+    def run(cu_):
+        qf = q.clone().requires_grad_(True)
+        kf = k.clone().requires_grad_(True)
+        vf = v.clone().requires_grad_(True)
+        out = nvfp4_flash_attn_func(
+            qf, kf, vf, scaling, causal=True, num_key_value_groups=groups,
+            cu_seqlens=cu_, stochastic_rounding=False,
+        )
+        out.backward(grad)
+        return out.detach(), qf.grad, kf.grad, vf.grad
+
+    try:
+        dense = run(None)
+        varlen = run(cu)
+    except Exception as exc:  # noqa: BLE001
+        _skip_if_unsupported(exc)
+
+    for a, b in zip(dense, varlen):
+        assert torch.equal(a, b)
+
+    # fwd-only API takes cu_seqlens too
+    out_fwd = nvfp4_flash_attention(
+        q, k, v, scaling, causal=True, num_key_value_groups=groups, cu_seqlens=cu
+    )
+    out_dense = nvfp4_flash_attention(
+        q, k, v, scaling, causal=True, num_key_value_groups=groups
+    )
+    assert torch.equal(out_fwd, out_dense)
+
+
+def test_varlen_rejects_bad_args():
+    torch.manual_seed(0)
+    z, h, s, d = 1, 4, 256, 128
+    q = torch.randn(z, h, s, d, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(z, h, s, d, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(z, h, s, d, device="cuda", dtype=torch.bfloat16)
+    cu = torch.tensor([0, 100, s], dtype=torch.int32)
+    sm = 1.0 / math.sqrt(d)
+
+    with pytest.raises(AssertionError, match="causal"):
+        nvfp4_flash_attn_func(q, k, v, sm, causal=False, cu_seqlens=cu)
+    with pytest.raises(AssertionError, match="cu_seqlens\\[-1\\]"):
+        bad = torch.tensor([0, 100, s + 1], dtype=torch.int32)
+        nvfp4_flash_attn_func(q, k, v, sm, causal=True, cu_seqlens=bad)
+    with pytest.raises(AssertionError, match="Z must be 1"):
+        q2 = torch.randn(2, h, s, d, device="cuda", dtype=torch.bfloat16)
+        k2 = torch.randn(2, h, s, d, device="cuda", dtype=torch.bfloat16)
+        v2 = torch.randn(2, h, s, d, device="cuda", dtype=torch.bfloat16)
+        nvfp4_flash_attn_func(q2, k2, v2, sm, causal=True, cu_seqlens=cu)
+    with pytest.raises(AssertionError, match="hp"):
+        nvfp4_flash_attn_func(
+            q, k, v, sm, causal=True, cu_seqlens=cu, backward_bf16_grad_dots=False
+        )
+    with pytest.raises(AssertionError, match="save_backward_packs"):
+        nvfp4_flash_attn_func(
+            q, k, v, sm, causal=True, cu_seqlens=cu, save_backward_packs=True
+        )
+
+
 @pytest.mark.parametrize("d", [128, 256])
 def test_no_gqa_auto_bf16_scratch_matches_fp32_scratch(d):
     torch.manual_seed(23 + d)
