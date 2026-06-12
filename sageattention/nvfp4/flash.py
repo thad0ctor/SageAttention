@@ -265,6 +265,13 @@ def _pack_mxfp8_along_k(
 _BWD_GRAD_DOTS_MODES = ("bf16", "fp4_rownorm", "fp8_rownorm", "fp4_legacy")
 _BWD_AUTO_FP4_MIN_SEQ = 4096
 
+# Capability flag for integrators (e.g. the axolotl custom-op wrapper): the
+# rownorm backward modes accept zshd ([Z, Sq, H, D]) dO/out directly (the
+# packprep kernel reads via explicit strides and the host-side dotrms
+# reduction is layout-aware), so callers no longer need a contiguous
+# [Z*H, Sq, D] transpose-fold of the gradient before the fp4_rownorm backward.
+_BWD_RN_DO_ZSHD = True
+
 
 def _resolve_backward_grad_dots(
     mode: str | None,
@@ -377,7 +384,12 @@ def _quant_nvfp4(
         s_xb = x.stride(0)
     else:
         B, R, K_read = x.shape
-        x = x.contiguous()
+        # the kernel reads via explicit (batch, row, col) strides, so any
+        # strided 3D view works directly — e.g. a [Z*H, S, D] head-major view
+        # of a [Z, S, H, D] (zshd) tensor. Only fold to contiguous when the
+        # contraction axis itself is strided (keeps the packed loads vectorized).
+        if x.stride(2) != 1:
+            x = x.contiguous()
         s_xr, s_xk = x.stride(1), x.stride(2)
         s_xb = x.stride(0)
     K = k_pad if k_pad is not None else K_read
@@ -1015,13 +1027,30 @@ _FWD_TILE_VARLEN = {
 _FWD_FUSED_QUANT_MAX_SEQ = 3072
 
 
-def _resolve_fwd_tiles(d, block_m, block_n, num_warps, num_stages, varlen=False):
+# Mean sample length at/above which a varlen batch stops using the short-pack
+# tile set: the _FWD_TILE_VARLEN sweep covered packed means {256,1024,2048}
+# only, and its small d256 tile (32,64) is badly undersized for long-document
+# packs (a single 32k sample pays it twice per step under grad checkpointing —
+# measured as the dominant share of ~370ms/step wrapper overhead vs FA2 at
+# dense 32k). Long means are dense-like: use the dense tables. Same 4096
+# crossover pick as the backward grad-dots auto gate.
+_FWD_VARLEN_DENSE_MIN_MEAN = 4096
+
+
+def _resolve_fwd_tiles(
+    d, block_m, block_n, num_warps, num_stages, varlen=False, mean_len=None
+):
     """Pick head_dim-tuned forward tiles when the caller left the generic defaults.
 
-    ``varlen=True`` selects the packed-sequence tile set (``_FWD_TILE_VARLEN``).
-    Explicit non-default tiles are honored as-is (autotune / manual override).
+    ``varlen=True`` selects the packed-sequence tile set (``_FWD_TILE_VARLEN``),
+    unless ``mean_len`` (mean sample length, host metadata) is provided and is
+    >= ``_FWD_VARLEN_DENSE_MIN_MEAN`` — long-mean packs are dense-like and use
+    the dense tables. Explicit non-default tiles are honored as-is (autotune /
+    manual override).
     """
     if (block_m, block_n, num_warps, num_stages) == _FWD_TILE_DEFAULT:
+        if varlen and mean_len is not None and mean_len >= _FWD_VARLEN_DENSE_MIN_MEAN:
+            varlen = False
         table = _FWD_TILE_VARLEN if varlen else _FWD_TILE
         return table.get(d, _FWD_TILE_DEFAULT)
     return block_m, block_n, num_warps, num_stages
@@ -2667,8 +2696,12 @@ def nvfp4_flash_attention_packed(
         )
         if varlen_arrays is None:
             varlen_arrays = _varlen_seq_arrays(cu_seqlens, s_q, qnv.device)
+    mean_len = (
+        s_q // max(int(cu_seqlens.numel()) - 1, 1) if cu_seqlens is not None else None
+    )
     block_m, block_n, num_warps, num_stages = _resolve_fwd_tiles(
-        d, block_m, block_n, num_warps, num_stages, varlen=varlen_arrays is not None
+        d, block_m, block_n, num_warps, num_stages,
+        varlen=varlen_arrays is not None, mean_len=mean_len,
     )
     # The caller padded V's key axis to ITS block_n (the public default, 128);
     # the resolved kernel block_n must still divide that padding (the V^T loads
@@ -2790,8 +2823,11 @@ def nvfp4_flash_attention(
             varlen_arrays = _varlen_seq_arrays(cu_seqlens, s_q, query.device)
     varlen = varlen_arrays is not None
     user_tiles = (block_m, block_n, num_warps, num_stages) != _FWD_TILE_DEFAULT
+    mean_len = (
+        s_q // max(int(cu_seqlens.numel()) - 1, 1) if cu_seqlens is not None else None
+    )
     block_m, block_n, num_warps, num_stages = _resolve_fwd_tiles(
-        d, block_m, block_n, num_warps, num_stages, varlen=varlen
+        d, block_m, block_n, num_warps, num_stages, varlen=varlen, mean_len=mean_len
     )
     # (Removed a short-non-causal d=128 perf special that forced block_m=128: at
     # D=128 block_m==D makes the FP4 dot_scaled operand square -> wrong (cos ~0.31).
@@ -3780,8 +3816,6 @@ def _run_bwd(
             "fp8_rownorm repacks Q^T/K^T as MXFP8; incompatible with saved "
             "forward FP4 transposed packs (save_backward_packs)"
         )
-    if rn_do and not fp8:
-        assert not do_zshd, "fp4_rownorm needs contiguous [Z*H,Sq,D] dO"
     if grad_dots != "fp4_legacy":
         # rownorm modes are RTN-only (measured: SR strictly worse and slower
         # once the scale underflow is gone) — the SR knobs become no-ops.
@@ -3939,8 +3973,18 @@ def _run_bwd(
         else:
             # GLOBAL per-feature rms of dO over the token axis (only a global
             # per-d factor folds out of the dV GEMM, whose contraction spans
-            # all of Sq).
-            dotrms = do.to(torch.float32).square().mean(dim=1).sqrt()
+            # all of Sq). One fused fp32-accumulating reduction over the bf16
+            # source (rms = ||x||_2 / sqrt(Sq)) — no fp32 materialization of
+            # dO (the old to(fp32).square().mean() chain cost ~1.5ms/call at
+            # 32k). Works on the zshd [Z, Sq, H, D] layout too: the token axis
+            # is dim 1 in both layouts, only the result needs the [Z*H, D]
+            # fold. The factor is folded out of the dV GEMM exactly, so the
+            # sqrt(sum)/sqrt(N) vs sqrt(mean) rounding difference only moves
+            # quantization points, never the unquantized math.
+            dotrms = torch.linalg.vector_norm(do, dim=1, dtype=torch.float32)
+            if do_zshd:
+                dotrms = dotrms.reshape(z * h, d)
+            dotrms = dotrms.mul_(s_q**-0.5)
             dotrms = torch.where(dotrms == 0, torch.ones_like(dotrms), dotrms)
             dotrms = dotrms.contiguous()
     else:
@@ -4155,6 +4199,7 @@ class _NVFP4FlashAttn(torch.autograd.Function):
         backward_ds_dq_sr,
         dkdv_scratch_bf16,
         backward_grad_dots,
+        out_zshd,
         block_m,
         block_n,
         num_warps,
@@ -4209,6 +4254,7 @@ class _NVFP4FlashAttn(torch.autograd.Function):
                 num_stages=num_stages,
                 return_lse=True,
                 return_packs=True,
+                out_layout="zshd" if out_zshd else "zhsd",
             )
             qnv, qsc, qtnv, qtsc, knv, ksc, vdnv, vdsc, ktnv, ktsc = packs
         else:
@@ -4225,6 +4271,7 @@ class _NVFP4FlashAttn(torch.autograd.Function):
                 num_warps=num_warps,
                 num_stages=num_stages,
                 return_lse=True,
+                out_layout="zshd" if out_zshd else "zhsd",
                 q_packs=q_packs_in,
                 k_packs=k_packs_in,
                 _varlen_arrays=varlen_arrays,
@@ -4250,7 +4297,9 @@ class _NVFP4FlashAttn(torch.autograd.Function):
             q_save,
             k_save,
             v_save,
-            out.reshape(z * h, s_q, d),
+            # zshd out is saved in its native [Z, Sq, H, D] layout; the backward
+            # kernels read it via explicit strides (o_zshd), no fold copy.
+            out if out_zshd else out.reshape(z * h, s_q, d),
             bias if bias is not None else torch.empty(0, device=query.device),
             lse,
             qnv,
@@ -4278,6 +4327,7 @@ class _NVFP4FlashAttn(torch.autograd.Function):
         # resolved by _resolve_backward_grad_dots above ("bf16" needs the
         # saved HP q/k/v and GQA group <= 8 — otherwise fp4_rownorm).
         ctx.backward_grad_dots = backward_grad_dots
+        ctx.out_zshd = out_zshd
         ctx.tiles = (block_m, block_n, num_warps, num_stages)
         ctx.has_bias = bias is not None
         return out
@@ -4312,7 +4362,14 @@ class _NVFP4FlashAttn(torch.autograd.Function):
             # bias-dummy pointer — o satisfies that.
             q = k = v = o
         seq_arrays = getattr(ctx, "seq_arrays", None)
-        do = grad_out.reshape(z * h, s_q, d).contiguous()
+        out_zshd = getattr(ctx, "out_zshd", False)
+        if out_zshd:
+            # zshd forward: grad_out arrives [Z, Sq, H, D] (usually contiguous —
+            # the HF consumer reshapes to [Z, Sq, H*D], so its grad is too); the
+            # backward kernels read it via explicit strides, no transpose fold.
+            do = grad_out if grad_out.stride(-1) == 1 else grad_out.contiguous()
+        else:
+            do = grad_out.reshape(z * h, s_q, d).contiguous()
         if ctx.backward_grad_dots == "bf16":
             dq, dk, dv = _run_bwd_hp(
                 q,
@@ -4330,6 +4387,8 @@ class _NVFP4FlashAttn(torch.autograd.Function):
                 ctx.scaling,
                 ctx.causal,
                 lse,
+                do_zshd=out_zshd,
+                o_zshd=out_zshd,
                 out_dtype=grad_out.dtype,
                 seq_arrays=seq_arrays,
             )
@@ -4337,7 +4396,7 @@ class _NVFP4FlashAttn(torch.autograd.Function):
                 dq.reshape(z, h, s_q, d),
                 dk.reshape(z, hk, s_kv, d),
                 dv.reshape(z, hk, s_kv, d),
-            ) + (None,) * 22
+            ) + (None,) * 23
         dkdv_scratch_bf16 = ctx.dkdv_scratch_bf16
         if dkdv_scratch_bf16 is None:
             # With no GQA reduction, each scratch element is only downcast once before
@@ -4380,6 +4439,8 @@ class _NVFP4FlashAttn(torch.autograd.Function):
             vsc_saved=vdsc if vdsc.numel() else None,
             ktnv_saved=ktnv if ktnv.numel() else None,
             ktsc_saved=ktsc if ktsc.numel() else None,
+            do_zshd=out_zshd,
+            o_zshd=out_zshd,
             grad_dots=ctx.backward_grad_dots,
             seq_arrays=seq_arrays,
         )
@@ -4390,7 +4451,7 @@ class _NVFP4FlashAttn(torch.autograd.Function):
         else:
             dk = dk.reshape(z, hk, s_kv, d).to(grad_out.dtype)
             dv = dv.reshape(z, hk, s_kv, d).to(grad_out.dtype)
-        return (dq, dk, dv) + (None,) * 22
+        return (dq, dk, dv) + (None,) * 23
 
 
 def nvfp4_flash_attn_func(
@@ -4410,6 +4471,7 @@ def nvfp4_flash_attn_func(
     dkdv_scratch_bf16: bool | None = None,
     backward_grad_dots: str | None = None,
     backward_bf16_grad_dots: bool | None = None,
+    out_layout: str = "zhsd",
     block_m: int = 64,
     block_n: int = 128,
     num_warps: int = 8,
@@ -4452,7 +4514,11 @@ def nvfp4_flash_attn_func(
     True -> "bf16", False -> "fp4_legacy".
 
     q:[Z,H,Sq,D], k/v:[Z,Hk,Skv,D]; D in {128,256}; supports causal and GQA.
-    Returns [Z,H,Sq,D] in query.dtype. ``dkdv_scratch_bf16=None`` auto-enables
+    Returns [Z,H,Sq,D] in query.dtype (``out_layout="zshd"``: [Z,Sq,H,D], the
+    HF attn_output layout, written directly by the forward kernel; the
+    backward then consumes the zshd gradient via strided reads — every
+    ``backward_grad_dots`` mode — so neither direction pays a transpose-fold
+    copy of the [Z*H*Sq*D] plane). ``dkdv_scratch_bf16=None`` auto-enables
     bf16 dQ/dK/dV scratch only for no-GQA bf16 backward, where it is
     bit-identical to fp32 scratch plus the final cast.
 
@@ -4478,6 +4544,8 @@ def nvfp4_flash_attn_func(
     _, hk, s_kv, _ = key.shape
     assert h % hk == 0 and h // hk == num_key_value_groups
     assert d in (128, 256)
+    if out_layout not in ("zhsd", "zshd"):
+        raise ValueError("out_layout must be 'zhsd' or 'zshd'")
     if backward_bf16_grad_dots is not None:
         assert backward_grad_dots is None, (
             "pass either backward_grad_dots or the deprecated "
@@ -4529,6 +4597,7 @@ def nvfp4_flash_attn_func(
         backward_ds_dq_stochastic_rounding,
         dkdv_scratch_bf16,
         backward_grad_dots,
+        out_layout == "zshd",
         block_m,
         block_n,
         num_warps,
