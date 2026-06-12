@@ -1423,8 +1423,12 @@ def _flash_bwd_kprep_kernel(
     Skv,
     Skv_pad,
     D: tl.constexpr,
+    HK: tl.constexpr,
     sk_n,
     sv_n,
+    sv_z,  # V batch (z) stride — V is read via explicit strides (any layout
+    sv_h,  # with a unit D stride, e.g. a zshd .transpose(1, 2) view); sv_h is
+    #        the kv-head stride. No contiguous fold needed by the caller.
     STORE_K: tl.constexpr,
     STORE_V: tl.constexpr,
     STORE_KT: tl.constexpr,
@@ -1452,7 +1456,11 @@ def _flash_bwd_kprep_kernel(
                 kTnv, kTsc = _pack_nvfp4_along_k(tl.trans(k), 0, seed, D, BLOCK_N, False)
     if STORE_V:
         v = tl.load(
-            v_ptr + pid_zhk * (Skv * sv_n) + offs_n[:, None] * sv_n + offs_d[None, :],
+            v_ptr
+            + (pid_zhk // HK) * sv_z
+            + (pid_zhk % HK) * sv_h
+            + offs_n[:, None] * sv_n
+            + offs_d[None, :],
             mask=nmask[:, None],
             other=0.0,
         ).to(tl.float32)
@@ -2022,6 +2030,8 @@ def _flash_bwd_dkdv_hp_kernel(
     sq_n,
     sk_n,
     sv_n,
+    sv_z,  # V batch/head strides (strided reads — no contiguous V fold)
+    sv_h,
     sdo_z,
     sdo_h,
     sdo_m,
@@ -2069,7 +2079,11 @@ def _flash_bwd_dkdv_hp_kernel(
         other=0,
     ).to(tl.float8e4nv, bitcast=True)
     v_t = tl.load(
-        v_ptr + zhk * (Skv * sv_n) + offs_n[:, None] * sv_n + offs_d[None, :],
+        v_ptr
+        + z * sv_z
+        + (zhk - z * HK) * sv_h
+        + offs_n[:, None] * sv_n
+        + offs_d[None, :],
         mask=nmask[:, None],
         other=0.0,
     )
@@ -2249,6 +2263,8 @@ def _flash_bwd_dq_hp_kernel(
     Skv,
     sk_n,
     sv_n,
+    sv_z,  # V batch/head strides (strided reads — no contiguous V fold)
+    sv_h,
     sdo_z,
     sdo_h,
     sdo_m,
@@ -2355,7 +2371,11 @@ def _flash_bwd_dq_hp_kernel(
         p = tl.where(s == _NEG_INF, 0.0, p)
 
         v_t = tl.load(
-            v_ptr + zhk * (Skv * sv_n) + offs_n[:, None] * sv_n + offs_d[None, :],
+            v_ptr
+            + z * sv_z
+            + (zhk - z * HK) * sv_h
+            + offs_n[:, None] * sv_n
+            + offs_d[None, :],
             mask=nmask[:, None],
             other=0.0,
         )
@@ -3374,6 +3394,23 @@ def nvfp4_flash_decode(
     )
 
 
+def _v_strides(v, hk):
+    """``(sv_z, sv_h, sv_n)`` batch/kv-head/row strides for the backward V reads.
+
+    Every backward V consumer (kprep's STORE_V pack and the hp dP = dO @ V^T
+    dots) reads V via these explicit strides, so the autograd wrapper can save
+    ``value`` AS-IS — e.g. the ``[Z, Hk, Skv, D]`` ``.transpose(1, 2)`` view of
+    a zshd projection output — instead of folding it to a contiguous
+    ``[Z*Hk, Skv, D]`` copy (~64MB / ~1.5ms per step at 9B/32k: V never goes
+    through RoPE, so unlike Q/K it stays a strided view in HF-style attention).
+    Accepts the legacy 3D ``[Z*Hk, Skv, D]`` layout (any batch/row strides) or
+    a 4D ``[Z, Hk, Skv, D]`` view; D must be unit-stride (callers fold else).
+    """
+    if v.dim() == 4:
+        return v.stride(0), v.stride(1), v.stride(2)
+    return hk * v.stride(0), v.stride(0), v.stride(1)
+
+
 def _run_bwd_hp(
     q,
     k,
@@ -3412,10 +3449,14 @@ def _run_bwd_hp(
     exact instead of FP4-quantized), so the backward_*_stochastic_rounding
     knobs are moot on this path.
 
-    Requires hp q/k/v/do/o and the forward ``lse``. Returns dq [z*h,s_q,d],
-    dk/dv [z*hk,s_kv,d], all in ``out_dtype`` (default: do.dtype).
+    Requires hp q/k/v/do/o and the forward ``lse``. ``v`` may be the legacy
+    contiguous-batch 3D ``[z*hk, s_kv, d]`` or any strided 4D
+    ``[z, hk, s_kv, d]`` view with unit D stride (``_v_strides``). Returns dq
+    [z*h,s_q,d], dk/dv [z*hk,s_kv,d], all in ``out_dtype`` (default: do.dtype).
     """
     assert lse is not None
+    assert v.stride(-1) == 1, "backward V must be unit-stride along D"
+    sv_z, sv_h, sv_n = _v_strides(v, hk)
     out_dtype = out_dtype or do.dtype
     ng = h // hk
     varlen = seq_arrays is not None
@@ -3606,8 +3647,11 @@ def _run_bwd_hp(
         s_kv,
         s_kv,
         D=d,
+        HK=hk,
         sk_n=k.stride(1),
-        sv_n=v.stride(1),
+        sv_n=sv_n,
+        sv_z=sv_z,
+        sv_h=sv_h,
         STORE_K=True,
         STORE_V=False,
         STORE_KT=False,
@@ -3641,7 +3685,9 @@ def _run_bwd_hp(
         s_kv,
         sq_n=q.stride(1),
         sk_n=k.stride(1),
-        sv_n=v.stride(1),
+        sv_n=sv_n,
+        sv_z=sv_z,
+        sv_h=sv_h,
         sdo_z=sdo_z,
         sdo_h=sdo_h,
         sdo_m=sdo_m,
@@ -3707,7 +3753,9 @@ def _run_bwd_hp(
             s_q,
             s_kv,
             sk_n=k.stride(1),
-            sv_n=v.stride(1),
+            sv_n=sv_n,
+            sv_z=sv_z,
+            sv_h=sv_h,
             sdo_z=sdo_z,
             sdo_h=sdo_h,
             sdo_m=sdo_m,
@@ -3772,7 +3820,9 @@ def _run_bwd(
     grad_dots="fp4_legacy",
     seq_arrays=None,
 ):
-    """Native-NVFP4 backward. q/do/o: [Z*H,Sq,D]; k/v: [Z*Hk,Skv,D] (hp).
+    """Native-NVFP4 backward. q/do/o: [Z*H,Sq,D]; k: [Z*Hk,Skv,D] (hp); v:
+    [Z*Hk,Skv,D] or any strided 4D [Z,Hk,Skv,D] view with unit D stride
+    (``_v_strides`` — kprep reads V via explicit strides).
     Returns dq [Z*H,Sq,D], dk/dv [Z*H,Skv,D] (per query head; GQA-reduced by the caller).
 
     ``grad_dots``: "fp4_legacy" (plain NVFP4 grad packs, honors the SR knobs),
@@ -4065,6 +4115,9 @@ def _run_bwd(
         ktnv_p = k.new_empty(z * hk, d, s_kv_pad // tp_div, dtype=torch.uint8)
         ktsc_p = k.new_empty(z * hk, d, s_kv_pad // tsc_div, dtype=torch.uint8)
     if not (reuse_k_pack and reuse_v_pack and reuse_kt_pack):
+        if not reuse_v_pack:
+            assert v.stride(-1) == 1, "backward V must be unit-stride along D"
+        sv_z, sv_h, sv_n = _v_strides(v, hk)
         _flash_bwd_kprep_kernel[(triton.cdiv(s_kv, kprep_block_n), z * hk)](
             k,
             v,
@@ -4078,8 +4131,11 @@ def _run_bwd(
             s_kv,
             s_kv_pad,
             D=d,
+            HK=hk,
             sk_n=k.stride(1),
-            sv_n=v.stride(1),
+            sv_n=sv_n,
+            sv_z=sv_z,
+            sv_h=sv_h,
             STORE_K=not reuse_k_pack,
             STORE_V=not reuse_v_pack,
             STORE_KT=not reuse_kt_pack,
@@ -4291,7 +4347,14 @@ class _NVFP4FlashAttn(torch.autograd.Function):
         else:
             q_save = query.reshape(z * h, s_q, d).contiguous()
             k_save = key.reshape(z * hk, s_kv, d).contiguous()
-            v_save = value.reshape(z * hk, s_kv, d).contiguous()
+            # V is saved AS-IS (4D [Z, Hk, Skv, D], any strides with unit D
+            # stride): every backward V consumer reads it via explicit
+            # batch/head/row strides (_v_strides), so the old
+            # reshape().contiguous() fold copy is gone. This matters because V
+            # (unlike Q/K) never goes through RoPE in HF-style attention, so it
+            # typically arrives as the .transpose(1, 2) view of a zshd
+            # projection — the fold was ~64MB / ~1.5ms per step at 9B/32k.
+            v_save = value if value.stride(-1) == 1 else value.contiguous()
         ctx.save_backward_packs = save_backward_packs
         ctx.save_for_backward(
             q_save,
