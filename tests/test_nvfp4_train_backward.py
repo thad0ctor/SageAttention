@@ -64,14 +64,16 @@ if _SKIP_REASON is None:
 
 
 def _cos(a: torch.Tensor, b: torch.Tensor) -> float:
+    """Cosine similarity of two tensors, flattened to fp32."""
     return F.cosine_similarity(
         a.flatten().float(), b.flatten().float(), dim=0
     ).item()
 
 
 def _skip_if_unsupported(exc: Exception):
+    """Skip (not fail) when the FP4 dot_scaled path is unsupported on this stack."""
     msg = str(exc).lower()
-    if "dot_scaled" in msg or "nvf4" in msg or "e2m1" in msg or "mxf4" in msg:
+    if "dot_scaled" in msg or "nvfp4" in msg or "nvf4" in msg or "e2m1" in msg or "mxf4" in msg:
         pytest.skip(f"tl.dot_scaled nvf4 unsupported on this stack: {exc}")
     raise exc
 
@@ -102,6 +104,7 @@ def _ref_grads(q, k, v, groups, scaling, causal, grad):
 
 
 def _fp4_grads(q, k, v, groups, scaling, causal, grad, **kw):
+    """Run nvfp4_flash_attn_func backward and return (out, dq, dk, dv) for a grad-dots mode."""
     qf = q.clone().detach().requires_grad_(True)
     kf = k.clone().detach().requires_grad_(True)
     vf = v.clone().detach().requires_grad_(True)
@@ -136,6 +139,7 @@ def _fp4_grads(q, k, v, groups, scaling, causal, grad, **kw):
     ],
 )
 def test_dqkv_correctness(grad_dots, causal, z, h, hk, s, d):
+    """dQ/dK/dV cosine vs bf16 autograd reference across shapes and both backward paths."""
     torch.manual_seed(0)
     groups = h // hk
     scaling = 1.0 / math.sqrt(d)
@@ -176,6 +180,7 @@ def test_dqkv_correctness(grad_dots, causal, z, h, hk, s, d):
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("causal", [False, True])
 def test_hp_path_at_least_as_accurate_as_fp4(causal):
+    """HP (bf16 grad-dots) backward grads are at least as accurate as legacy FP4."""
     torch.manual_seed(1)
     z, h, hk, s, d = 1, 4, 4, 512, 128  # MHA so bf16 hp is not downgraded
     groups = h // hk
@@ -224,6 +229,7 @@ def test_hp_path_at_least_as_accurate_as_fp4(causal):
     "grad_dots", ["bf16", "fp4_legacy", "fp4_rownorm", "fp8_rownorm"]
 )
 def test_all_modes_gqa(grad_dots):
+    """Every backward grad-dots mode clears its cosine floor on a GQA shape."""
     torch.manual_seed(2)
     z, h, hk, s, d = 1, 8, 2, 256, 128  # GQA g=4 (<= 8 so bf16 not downgraded)
     groups = h // hk
@@ -261,6 +267,7 @@ def test_all_modes_gqa(grad_dots):
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("grad_dots", ["bf16", "fp4_rownorm"])
 def test_grad_finiteness_shape_no_leak(grad_dots):
+    """Grads are finite, correctly shaped, and absent for requires_grad=False inputs."""
     torch.manual_seed(3)
     z, h, hk, s, d = 1, 4, 2, 128, 128
     groups = h // hk
@@ -299,6 +306,7 @@ def test_grad_finiteness_shape_no_leak(grad_dots):
 @pytest.mark.parametrize("grad_dots", ["bf16", "fp4_rownorm"])
 @pytest.mark.parametrize("d", [128, 256])
 def test_varlen_backward_complement(grad_dots, d):
+    """Varlen/packed backward grads match per-sequence SDPA autograd."""
     torch.manual_seed(4)
     lens = [40, 333, 96, 531]  # ragged, sub-tile + straddling 64/128 boundaries
     s = sum(lens)
@@ -365,6 +373,7 @@ def test_varlen_backward_complement(grad_dots, d):
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("grad_dots", ["bf16", "fp4_rownorm", "fp4_legacy"])
 def test_backward_determinism_rtn(grad_dots):
+    """RTN (non-stochastic) backward is bit-reproducible across runs."""
     torch.manual_seed(5)
     z, h, hk, s, d = 1, 4, 2, 256, 128
     groups = h // hk
@@ -376,6 +385,7 @@ def test_backward_determinism_rtn(grad_dots):
     grad = torch.randn_like(q)
 
     def run():
+        """Run one forward+backward for the given mode and return the grads."""
         qf = q.clone().detach().requires_grad_(True)
         kf = k.clone().detach().requires_grad_(True)
         vf = v.clone().detach().requires_grad_(True)

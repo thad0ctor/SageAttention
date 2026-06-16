@@ -40,7 +40,7 @@ def _cos(a: torch.Tensor, b: torch.Tensor) -> float:
 def _skip_if_unsupported(exc: Exception):
     """Skip (not fail) when the FP4 ``dot_scaled`` path is unsupported on this stack."""
     msg = str(exc).lower()
-    if "dot_scaled" in msg or "nvf4" in msg or "e2m1" in msg or "mxf4" in msg:
+    if "dot_scaled" in msg or "nvfp4" in msg or "nvf4" in msg or "e2m1" in msg or "mxf4" in msg:
         pytest.skip(f"tl.dot_scaled nvf4 unsupported on this stack: {exc}")
     raise exc
 

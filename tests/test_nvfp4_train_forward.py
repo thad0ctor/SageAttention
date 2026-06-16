@@ -57,14 +57,16 @@ _COS_FLOOR = 0.95
 
 
 def _cos(a: torch.Tensor, b: torch.Tensor) -> float:
+    """Cosine similarity of two tensors, flattened to fp32."""
     return F.cosine_similarity(
         a.flatten().float(), b.flatten().float(), dim=0
     ).item()
 
 
 def _skip_if_unsupported(exc: Exception):
+    """Skip (not fail) when the FP4 dot_scaled path is unsupported on this stack."""
     msg = str(exc).lower()
-    if "dot_scaled" in msg or "nvf4" in msg or "e2m1" in msg or "mxf4" in msg:
+    if "dot_scaled" in msg or "nvfp4" in msg or "nvf4" in msg or "e2m1" in msg or "mxf4" in msg:
         pytest.skip(f"tl.dot_scaled nvf4 unsupported on this stack: {exc}")
     raise exc
 
@@ -103,6 +105,7 @@ def _sdpa_ref(q, k, v, scaling, causal, groups):
 @pytest.mark.parametrize("s", [17, 128, 200, 512])
 @pytest.mark.parametrize("z", [1, 2])
 def test_dense_forward_parity(causal, h, hk, d, s, z):
+    """Dense forward vs bf16 SDPA across causal/GQA/MHA/head-dim/seqlen/batch."""
     torch.manual_seed(0)
     groups = h // hk
     scaling = 1.0 / math.sqrt(d)
@@ -132,6 +135,7 @@ def test_dense_forward_parity(causal, h, hk, d, s, z):
 @pytest.mark.parametrize("s", [1, 16, 33])
 @pytest.mark.parametrize("d", [128, 256])
 def test_dense_forward_tiny_seqlen(causal, s, d):
+    """Forward at sub-tile seqlens (1/16/33): shape, finiteness, parity."""
     torch.manual_seed(1)
     z, h, hk = 1, 4, 2
     groups = h // hk
@@ -175,6 +179,7 @@ def test_dense_forward_tiny_seqlen(causal, s, d):
 )
 @pytest.mark.parametrize("d", [128, 256])
 def test_dense_forward_cross_attention(causal, s_q, s_kv, d):
+    """Non-causal cross attention (Sq != Skv) matches bf16 SDPA."""
     torch.manual_seed(2)
     z, h, hk = 1, 8, 2
     groups = h // hk
@@ -208,6 +213,7 @@ def test_dense_forward_cross_attention(causal, s_q, s_kv, d):
 @pytest.mark.parametrize("d", [128, 256])
 @pytest.mark.parametrize("s", [200, 512])
 def test_train_func_forward_parity(causal, h, hk, d, s):
+    """nvfp4_flash_attn_func forward matches SDPA and the forward-only entry."""
     torch.manual_seed(3)
     z, groups = 1, h // hk
     scaling = 1.0 / math.sqrt(d)
@@ -244,6 +250,7 @@ def test_train_func_forward_parity(causal, h, hk, d, s):
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("d", [128, 256])
 def test_forward_deterministic(causal, d):
+    """Two forward calls on the same inputs are bit-identical (no SR in forward)."""
     torch.manual_seed(4)
     z, h, hk, s = 2, 8, 2, 512
     groups = h // hk
@@ -286,6 +293,7 @@ def test_forward_deterministic(causal, d):
 # construction. We compare to nvfp4_flash_attn_func's forward too.
 # ---------------------------------------------------------------------------
 def _cu(lens):
+    """Build a cu_seqlens int32 tensor from a list of sequence lengths."""
     return torch.tensor(
         [0] + torch.tensor(lens).cumsum(0).tolist(), dtype=torch.int32
     )
@@ -319,6 +327,7 @@ def _varlen_sdpa_ref(q, k, v, lens, scaling, groups):
     ],
 )
 def test_varlen_forward_parity(h, hk, d, lens):
+    """Packed block-diagonal-causal varlen forward matches per-sample SDPA."""
     torch.manual_seed(5)
     s = sum(lens)
     z, groups = 1, h // hk
@@ -356,6 +365,7 @@ def test_varlen_forward_parity(h, hk, d, lens):
 # functional check of the block-diagonal mask, independent of the SDPA ref.
 # ---------------------------------------------------------------------------
 def test_varlen_no_cross_sequence_leakage():
+    """Perturbing one packed sample leaves the other samples' outputs unchanged."""
     torch.manual_seed(6)
     d = 128
     lens = [128, 256, 200]
