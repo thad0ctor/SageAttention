@@ -300,6 +300,7 @@ class NVFP4KVCache:
         the old bulk while keeping recent attention exact.
         """
         assert self.recent_window > 0, "hybrid_decode needs recent_window > 0"
+        assert self.length > 0, "hybrid_decode requires at least one token (call prefill/append first)"
         z, h, _, d = query.shape
         W = self.recent_window
         s = self.length
