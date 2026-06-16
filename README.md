@@ -1,4 +1,61 @@
 # SageAttention
+
+> ## ⚡ This fork — Native NVFP4 attention for Blackwell (`sageattention.nvfp4`)
+>
+> This fork adds **`sageattention.nvfp4`**: a **pure-Triton, native-NVFP4 flash-attention** stack for NVIDIA **Blackwell `sm_120`** (RTX 5090, RTX PRO 6000) covering **both training and inference/serving**. Operands are packed to **NVFP4** — 4-bit `e2m1` data with **`e4m3` FP8 per-16 block scales** — and every matmul runs as a Triton `tl.dot_scaled` FP4 tensor-core op. It has **no CUDA build dependency** (installs and imports even when SageAttention's compiled extension is skipped).
+>
+> Unlike the inference-only Sage-3 FP4 kernel, this provides a fully **differentiable** FP4 forward **and** backward — so FP4 attention runs inside a real training loop — *plus* a stateful FP4 KV cache for low-latency decode.
+>
+> ### Training features
+> - **Differentiable native-NVFP4 attention** — `nvfp4_flash_attn_func`; all four grad GEMMs run as FP4 `tl.dot_scaled`. Causal masking + GQA; head dim `D ∈ {128, 256}`.
+> - **Varlen (packed-sequence) attention** — block-diagonal causal over `cu_seqlens`, so sample-packed batches cost `Σ sᵢ²` instead of `S²` (no cross-sample attention contamination); varlen seq-arrays are cached on the `cu_seqlens` tensor.
+> - **HP-grad-dots backward** — FP4 `S`/`dP` recomputes with **bf16 grad GEMMs on exact operands** + in-kernel GQA reduce: ~**1.5–1.7× faster** than the all-FP4 backward, much more accurate (grad cosine vs bf16 SDPA ≈ **0.99** vs ~0.94 RTN), and ~**4× less** backward scratch. Auto-enables on the varlen/packed path.
+> - **Pre-packed Q/K training forward** + varlen-tuned forward tiles; variance-normalized FP4/FP8 grad backward with an `e4m3` scale-underflow fix.
+> - Measured: the full NVFP4 stack trains a **Qwen3.5-9B LoRA ~1.42× faster than bf16 at −6% memory** (RTX PRO 6000, seq 2048, sample-packed).
+>
+> ### Inference / serving features
+> - **`NVFP4KVCache`** — a stateful FP4 GQA KV cache grown one token at a time (`prefill` + incremental `append`), storing K/V in NVFP4 for **~3.5–4× less KV memory** than bf16. Incremental packing reconstructs one-shot packing **exactly** (cosine `1.0`).
+> - **Split-K FP4 decode kernel** — `nvfp4_flash_decode_prequant` / `nvfp4_flash_decode`: compute-only decode straight from the FP4 cache, **~0.98 cosine vs bf16 SDPA**.
+> - **Strided cache read** — the decode kernel reads the live cache via its real strides instead of copying the whole cache every step: **+36–69% per decode step, bit-identical** (the win scales with batch × context — at batch 16 / 32k context the copy was ~70% of the step).
+> - **`hybrid_decode`** — keeps the softmax-dominant recent tokens in **exact bf16** (a recent-window ring) and uses FP4 only on the older bulk, merged with an exact LSE combine — a decode-accuracy lever at near-zero extra memory.
+>
+> ### Quick start
+> ```bash
+> SAGEATTN_SKIP_CUDA_BUILD=1 pip install -e .      # Triton-only, no CUDA build
+> ```
+> ```python
+> import math, torch
+> from sageattention.nvfp4 import (
+>     nvfp4_flash_attn_func, NVFP4KVCache, nvfp4_flash_decode_prequant,
+> )
+>
+> # --- training: differentiable FP4 attention (full FP4 forward + backward) ---
+> # q: [Z, H, Sq, D]   k/v: [Z, Hk, Skv, D]
+> out = nvfp4_flash_attn_func(
+>     q, k, v,
+>     scaling=1.0 / math.sqrt(q.shape[-1]),
+>     causal=True,
+>     num_key_value_groups=q.shape[1] // k.shape[1],
+> )
+> out.sum().backward()
+>
+> # --- inference: FP4 KV-cache decode ---
+> g = q.shape[1] // k.shape[1]
+> cache = NVFP4KVCache(z, hk, d, max_seq_len=8192, device="cuda", dtype=torch.bfloat16)
+> cache.prefill(k, v)                              # or cache.append(k_t, v_t) per step
+> o = nvfp4_flash_decode_prequant(
+>     q_t, cache.get_packed(), scaling=1.0 / math.sqrt(d), num_key_value_groups=g,
+> )
+> ```
+>
+> ### Validation
+> On RTX 5090 (`sm_120`) the FP4 attention test suite passes **43/43** (decode parity + varlen + backward). The KV-cache harness reconstructs one-shot packing exactly (cos `1.0`), holds ≥ `0.97` cosine vs bf16 SDPA, and stores K/V **3.5–4×** smaller than bf16 — see `example/_validate_kv_cache.py` and the end-to-end GQA demo `example/nvfp4_decode_demo.py`.
+>
+> **Requires** Triton ≥ 3.7 (the `D=128` fast tile needs correct `dot_scaled` e2m1 lowering) and a Blackwell `sm_120` GPU.
+>
+> ---
+> *The upstream SageAttention README follows.*
+
 <!-- We are continuously updating more features. You could **Star** and **Watch** our repository to stay updated.
 
 --- -->
@@ -150,35 +207,6 @@ python cogvideox_infer.py --model cogvideox-2b --compile --attention_type sage
 ### Kernel Benchmarking
 We provide a benchmarking script to compare the speed of different kernels including SageAttention, FlashAttention2 and FlashAttention3. Please refer to the `benchmark/` directory for more details.
  
-## NVFP4 attention (training, sm_120)
-
-This fork adds `sageattention.nvfp4`, a **pure-Triton native-NVFP4 flash
-attention** (e2m1-packed operands + e4m3 group-16 block scales) for Blackwell
-**sm_120** GPUs. Unlike the inference-only Sage-3 kernel, it provides a fully
-**differentiable native-NVFP4 backward** (all four grad GEMMs run as FP4
-`tl.dot_scaled` ops), so it is usable inside a training loop. Supports causal
-masking and GQA; head dim `D` must be in `{128, 256}`.
-
-The submodule is Triton-only and has **no CUDA build dependency** — it installs
-and imports even when SageAttention's compiled extension is skipped:
-
-```bash
-SAGEATTN_SKIP_CUDA_BUILD=1 pip install -e .
-```
-
-```python
-import math
-from sageattention.nvfp4 import nvfp4_flash_attn_func
-
-# q: [Z, H, Sq, D], k/v: [Z, Hk, Skv, D]
-out = nvfp4_flash_attn_func(
-    q, k, v,
-    scaling=1.0 / math.sqrt(q.shape[-1]),
-    causal=True,
-    num_key_value_groups=q.shape[1] // k.shape[1],
-)
-```
-
 ## Performance
 ### Speed of Kernels
 
