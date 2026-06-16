@@ -3417,6 +3417,37 @@ def _v_strides(v, hk):
     return hk * v.stride(0), v.stride(0), v.stride(1)
 
 
+def _resolve_bwd_tiles(d, varlen, s_kv, s_q):
+    """Per-shape HP-backward (dkdv, dq-recompute) tiles, swept on the 5090
+    (sm_120, 170 SMs). Returns ``((bm,bn,w,st)_dkdv, (bm,bn,w,st)_dq)``.
+
+    The dq-RECOMPUTE pass is the lever: its best (BLOCK_M, num_stages) shifts
+    with head_dim and the packed-vs-dense regime, and the original tiles were
+    swept on the RTX PRO 6000 (188 SMs) — badly mismatched on the 5090's 170 SMs.
+    dq-recompute only runs at large seq (smaller seq uses the dscache dqc_* tiles
+    below), so its tiles target the >~7k regime:
+      d256: (32,32,4,3) wins packed AND dense (1.05-1.64x vs the old (64,32,4,2);
+            stages=3 is load-bearing — stages=2 regresses dense long-context).
+      d128: (64,32,4,2) wins packed AND dense (up to 1.51x packed vs the old
+            (128,32,8,3)).
+    dkdv is occupancy-flat (shipped tiles within ~2% everywhere swept), so it
+    keeps its seq-bucketed table (grid is z*hk*cdiv(s_kv, BN) programs — short
+    seq wants narrow key tiles, long seq the deeper-m tile).
+    """
+    if d <= 128:
+        if s_kv <= 2048:
+            dkdv = (32, 32, 4, 3)
+        elif s_kv <= 4096:
+            dkdv = (64, 64, 8, 2)
+        else:
+            dkdv = (32, 64, 4, 2)
+        dq = (64, 32, 4, 2)
+    else:
+        dkdv = (32, 32, 4, 3)
+        dq = (32, 32, 4, 3)
+    return dkdv, dq
+
+
 def _run_bwd_hp(
     q,
     k,
@@ -3476,33 +3507,10 @@ def _run_bwd_hp(
     dk = torch.empty(z * hk, s_kv, d, device=q.device, dtype=out_dtype)
     dv = torch.empty(z * hk, s_kv, d, device=q.device, dtype=out_dtype)
 
-    # d=128 tiles hold two bf16 [64, D] hp tiles per stage comfortably; d=256
-    # doubles every plane, so halve the m-tiles to stay inside the 99KB budget.
-    # Within d=128, swept (RTX PRO 6000): short seq wants narrow key tiles +
-    # fewer warps (occupancy: the dkdv grid is z*hk*cdiv(s_kv, BN) programs),
-    # long seq wants the deeper-m dq tile.
-    if d <= 128:
-        if s_kv <= 2048:
-            dkdv_block_m, dkdv_block_n, dkdv_warps, dkdv_stages = 32, 32, 4, 3
-        elif s_kv <= 4096:
-            dkdv_block_m, dkdv_block_n, dkdv_warps, dkdv_stages = 64, 64, 8, 2
-        else:
-            dkdv_block_m, dkdv_block_n, dkdv_warps, dkdv_stages = 32, 64, 4, 2
-        if s_q >= 8192:
-            dq_block_m, dq_block_n, dq_warps, dq_stages = 128, 32, 8, 3
-        else:
-            dq_block_m, dq_block_n, dq_warps, dq_stages = 64, 64, 8, 2
-    else:
-        dkdv_block_m, dkdv_block_n, dkdv_warps, dkdv_stages = 32, 32, 4, 3
-        # dQ recompute m-tile: packed-varlen wants the narrower 32-row tile
-        # (more programs -> better sm_120 occupancy, and short samples straddle
-        # fewer ragged kv boundaries); dense long-context wants 64 (5090 sweep:
-        # varlen 32 is 1.15-1.24x at 4-8k, dense 32 is 0.81x). Recompute only,
-        # the d256 dscache pass uses dqc_* below.
-        if varlen:
-            dq_block_m, dq_block_n, dq_warps, dq_stages = 32, 32, 4, 2
-        else:
-            dq_block_m, dq_block_n, dq_warps, dq_stages = 64, 32, 4, 2
+    (
+        (dkdv_block_m, dkdv_block_n, dkdv_warps, dkdv_stages),
+        (dq_block_m, dq_block_n, dq_warps, dq_stages),
+    ) = _resolve_bwd_tiles(d, varlen, s_kv, s_q)
     if os.environ.get("NVFP4_BWD_TILE_OVERRIDE"):  # sweep instrumentation
         _e = os.environ
         dkdv_block_m = int(_e.get("NVFP4_DKDV_BM", dkdv_block_m))
