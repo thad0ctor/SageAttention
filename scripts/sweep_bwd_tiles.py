@@ -71,6 +71,7 @@ if __name__ == "__main__":
 
     print("=== sweep dkdv (dq fixed at baseline) ===")
     best_dkdv = (t0, dict(base))
+    skipped = []  # (config, error) — report so silent failures don't bias the winner
     for bm, bn, w, st in itertools.product([16,32,64], [32,64,128], [4,8], [2,3]):
         if bm*bn*256 > 64*128*256*2: continue  # rough smem guard for d256
         for kk, vv in base.items(): os.environ[kk]=vv
@@ -79,16 +80,21 @@ if __name__ == "__main__":
         try:
             t = time_bwd(ctx)
         except Exception as e:
+            skipped.append(((bm,bn,w,st), repr(e)))
             continue
         mark = " *" if t < best_dkdv[0]-0.003 else ""
         if t < best_dkdv[0]:
             best_dkdv = (t, {"NVFP4_DKDV_BM":str(bm),"NVFP4_DKDV_BN":str(bn),"NVFP4_DKDV_W":str(w),"NVFP4_DKDV_S":str(st)})
         print(f"  dkdv bm={bm} bn={bn} w={w} s={st}: {t:.3f} ms{mark}")
-    print(f"  BEST dkdv: {best_dkdv[0]:.3f} ms {best_dkdv[1]}\n")
+    print(f"  BEST dkdv: {best_dkdv[0]:.3f} ms {best_dkdv[1]}  (skipped {len(skipped)})")
+    if skipped:
+        print(f"    first skip: dkdv {skipped[0][0]} -> {skipped[0][1][:120]}")
+    print()
 
     print("=== sweep dq recompute (dkdv fixed at BEST) ===")
     dkbest = best_dkdv[1]
     best_dq = (best_dkdv[0], dict(base))
+    skipped = []
     for bm, bn, w, st in itertools.product([32,64,128], [16,32,64], [4,8], [2,3]):
         for kk, vv in base.items(): os.environ[kk]=vv
         for kk, vv in dkbest.items(): os.environ[kk]=vv
@@ -96,11 +102,14 @@ if __name__ == "__main__":
         os.environ["NVFP4_DQ_W"]=str(w); os.environ["NVFP4_DQ_S"]=str(st)
         try:
             t = time_bwd(ctx)
-        except Exception:
+        except Exception as e:
+            skipped.append(((bm,bn,w,st), repr(e)))
             continue
         mark = " *" if t < best_dq[0]-0.003 else ""
         if t < best_dq[0]:
             best_dq = (t, {"NVFP4_DQ_BM":str(bm),"NVFP4_DQ_BN":str(bn),"NVFP4_DQ_W":str(w),"NVFP4_DQ_S":str(st)})
         print(f"  dq bm={bm} bn={bn} w={w} s={st}: {t:.3f} ms{mark}")
+    if skipped:
+        print(f"  (skipped {len(skipped)}; first: dq {skipped[0][0]} -> {skipped[0][1][:120]})")
     print(f"  BEST overall: {best_dq[0]:.3f} ms (baseline {t0:.3f}, {t0/best_dq[0]:.3f}x)")
     print(f"  dkdv {dkbest}\n  dq   {best_dq[1]}")

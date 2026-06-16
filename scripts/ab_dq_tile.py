@@ -55,6 +55,11 @@ def dq_kernel_ms(ctx, bm, reps=40):
             us[e.key] += getattr(e, "self_device_time_total", 0) or 0
     dq = us.get("_flash_bwd_dq_hp_kernel", 0)/reps/1000
     dkdv = us.get("_flash_bwd_dkdv_hp_kernel", 0)/reps/1000
+    if dq <= 0 or dkdv <= 0:
+        raise RuntimeError(
+            f"profiler kernels not found (dq={dq}, dkdv={dkdv}); "
+            f"available CUDA keys: {sorted(us.keys())}"
+        )
     return dq, dkdv
 
 

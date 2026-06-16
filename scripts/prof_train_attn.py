@@ -85,8 +85,10 @@ def profile_shape(tag, z, h, hk, s, d, varlen):
     torch.cuda.synchronize()
 
     ITER = 20
-    # wall-clock fwd+bwd
+    # wall-clock fwd+bwd. Reset peak BEFORE the timed loop so warmup allocations
+    # don't inflate the reported peak (it must reflect only the measured window).
     torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
     ev0, ev1 = torch.cuda.Event(True), torch.cuda.Event(True)
     ev0.record()
     for _ in range(ITER):
@@ -96,7 +98,6 @@ def profile_shape(tag, z, h, hk, s, d, varlen):
     torch.cuda.synchronize()
     wall_ms = ev0.elapsed_time(ev1) / ITER
     peak = torch.cuda.max_memory_allocated() / 2**20
-    torch.cuda.reset_peak_memory_stats()
 
     with profile(activities=[ProfilerActivity.CUDA], record_shapes=False) as prof:
         for _ in range(ITER):
