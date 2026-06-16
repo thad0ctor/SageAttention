@@ -26,7 +26,9 @@ SHAPES = [(256, 16, 4), (128, 32, 8), (128, 32, 4)]
 SS = [2048, 8192]
 VARLENS = [True, False]
 
-# shipped defaults (from _run_bwd_hp) per (d, s) for the baseline column
+# PRE-PR baseline tiles for the "before" column — intentionally frozen literals
+# (NOT _resolve_bwd_tiles): the resolver now holds this sweep's WINNERS, so
+# importing it would report 1.0x. These are the tiles that shipped before this PR.
 def shipped(d, s_kv, s_q):
     if d <= 128:
         if s_kv <= 2048: dk = (32, 32, 4, 3)

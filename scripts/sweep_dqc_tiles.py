@@ -8,6 +8,7 @@ import math, os, itertools
 from collections import defaultdict
 import torch
 from torch.profiler import ProfilerActivity, profile
+from triton.runtime.errors import OutOfResources
 from sageattention.nvfp4.flash import _run_bwd_hp, nvfp4_flash_attention, _varlen_seq_arrays
 
 DEV, DT = "cuda", torch.bfloat16
@@ -74,18 +75,23 @@ for (d, h, hk, s, vl) in CASES:
     ctx = setup(d, h, hk, s, vl)
     ship = SHIP[d]
     base = dqc_ms(ctx, ship)
-    best = (base, ship); skip = 0
+    best = (base, ship); skip = 0; first_err = None
     for t in DQC_GRID:
         if t == ship: continue
         try:
             v = min(dqc_ms(ctx, t) for _ in range(2))
-        except Exception:
-            skip += 1; continue
+        except (RuntimeError, torch.cuda.OutOfMemoryError, OutOfResources) as e:
+            # smem/register over-subscription or transient CUDA errors for this
+            # tile — skip it, but let unexpected exceptions surface.
+            skip += 1
+            if skip == 1:
+                first_err = f"{t} -> {type(e).__name__}: {str(e)[:100]}"
+            continue
         if v < best[0]: best = (v, t)
     results.append((d, h, hk, s, vl, ship, base, best, skip))
     print(f"d{d} h{h} hk{hk} S{s} {'VL' if vl else 'dense':5}: "
           f"ship{ship} {base*1000:.0f}us -> {best[1]} {best[0]*1000:.0f}us "
-          f"({base/best[0]:.2f}x) [skip {skip}]", flush=True)
+          f"({base/best[0]:.2f}x) [skip {skip}{'; '+first_err if first_err else ''}]", flush=True)
 
 print("\n===== DQC SUMMARY =====")
 for (d, h, hk, s, vl, ship, base, best, skip) in results:

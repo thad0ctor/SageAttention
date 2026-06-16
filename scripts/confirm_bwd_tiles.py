@@ -65,8 +65,11 @@ for (d, h, hk) in SHAPES:
             cands = CANDS[d]
             # 3 interleaved passes over all candidates
             samples = {t: [] for t in cands}
-            for _ in range(3):
-                for t in cands:
+            for i in range(3):
+                # alternate candidate order each pass so slow thermal/clock drift
+                # doesn't systematically favor whichever tile is measured first
+                order = cands if i % 2 == 0 else list(reversed(cands))
+                for t in order:
                     samples[t].append(dq_ms(ctx, t))
             med = {t: sorted(samples[t])[1] for t in cands}
             best = min(med, key=med.get)
