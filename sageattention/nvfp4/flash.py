@@ -3417,6 +3417,45 @@ def _v_strides(v, hk):
     return hk * v.stride(0), v.stride(0), v.stride(1)
 
 
+def _resolve_bwd_tiles(d, varlen, s_kv, s_q):
+    """Per-shape HP-backward tiles, swept on the 5090 (sm_120, 170 SMs). Returns
+    ``(dkdv, dq, dqc)`` 4-tuples ``(bm, bn, w, st)``: dkdv (always), the
+    dq-RECOMPUTE pass (large seq), and the dscache dQ pass dqc (smaller seq).
+
+    Both dQ passes are the lever — their best (BLOCK_M, num_stages) shifts with
+    head_dim and the packed-vs-dense regime, and the original tiles were swept on
+    the RTX PRO 6000 (188 SMs), badly mismatched on the 5090's 170 SMs. Packed
+    varlen (many short samples) wants narrow tiles for occupancy + less ragged
+    waste; dense long-context wants the wider tile.
+
+      dq-recompute (only runs at large seq, >~7k):
+        d256: (32,32,4,3) packed AND dense (1.05-1.64x vs old (64,32,4,2);
+              stages=3 load-bearing — stages=2 regresses dense long-context).
+        d128: (64,32,4,2) packed AND dense (up to 1.51x vs old (128,32,8,3)).
+      dscache dqc (smaller seq — d256 <=~6850, d128 in {<=1448, 4096-4837}):
+        d256: varlen (32,32,4,3) (1.29-1.39x vs old (64,64,8,3)); dense keeps
+              (64,64,8,3) (the narrow tile regresses dense long-context).
+        d128: (64,32,4,3) packed AND dense (up to 1.53x vs old (128,64,8,3)).
+
+    dkdv is occupancy-flat (shipped tiles within ~2% everywhere swept), so it
+    keeps its seq-bucketed table (grid is z*hk*cdiv(s_kv, BN) programs).
+    """
+    if d <= 128:
+        if s_kv <= 2048:
+            dkdv = (32, 32, 4, 3)
+        elif s_kv <= 4096:
+            dkdv = (64, 64, 8, 2)
+        else:
+            dkdv = (32, 64, 4, 2)
+        dq = (64, 32, 4, 2)
+        dqc = (64, 32, 4, 3)
+    else:
+        dkdv = (32, 32, 4, 3)
+        dq = (32, 32, 4, 3)
+        dqc = (32, 32, 4, 3) if varlen else (64, 64, 8, 3)
+    return dkdv, dq, dqc
+
+
 def _run_bwd_hp(
     q,
     k,
@@ -3476,25 +3515,11 @@ def _run_bwd_hp(
     dk = torch.empty(z * hk, s_kv, d, device=q.device, dtype=out_dtype)
     dv = torch.empty(z * hk, s_kv, d, device=q.device, dtype=out_dtype)
 
-    # d=128 tiles hold two bf16 [64, D] hp tiles per stage comfortably; d=256
-    # doubles every plane, so halve the m-tiles to stay inside the 99KB budget.
-    # Within d=128, swept (RTX PRO 6000): short seq wants narrow key tiles +
-    # fewer warps (occupancy: the dkdv grid is z*hk*cdiv(s_kv, BN) programs),
-    # long seq wants the deeper-m dq tile.
-    if d <= 128:
-        if s_kv <= 2048:
-            dkdv_block_m, dkdv_block_n, dkdv_warps, dkdv_stages = 32, 32, 4, 3
-        elif s_kv <= 4096:
-            dkdv_block_m, dkdv_block_n, dkdv_warps, dkdv_stages = 64, 64, 8, 2
-        else:
-            dkdv_block_m, dkdv_block_n, dkdv_warps, dkdv_stages = 32, 64, 4, 2
-        if s_q >= 8192:
-            dq_block_m, dq_block_n, dq_warps, dq_stages = 128, 32, 8, 3
-        else:
-            dq_block_m, dq_block_n, dq_warps, dq_stages = 64, 64, 8, 2
-    else:
-        dkdv_block_m, dkdv_block_n, dkdv_warps, dkdv_stages = 32, 32, 4, 3
-        dq_block_m, dq_block_n, dq_warps, dq_stages = 64, 32, 4, 2
+    (
+        (dkdv_block_m, dkdv_block_n, dkdv_warps, dkdv_stages),
+        (dq_block_m, dq_block_n, dq_warps, dq_stages),
+        (dqc_block_m, dqc_block_n, dqc_warps, dqc_stages),
+    ) = _resolve_bwd_tiles(d, varlen, s_kv, s_q)
     if os.environ.get("NVFP4_BWD_TILE_OVERRIDE"):  # sweep instrumentation
         _e = os.environ
         dkdv_block_m = int(_e.get("NVFP4_DKDV_BM", dkdv_block_m))
@@ -3548,10 +3573,7 @@ def _run_bwd_hp(
         # pipeline stage in the 99KB budget at D=256
         dkdv_stages = min(dkdv_stages, 2)
     if dq_mode == "dscache":
-        if d <= 128:
-            dqc_block_m, dqc_block_n, dqc_warps, dqc_stages = 128, 64, 8, 3
-        else:
-            dqc_block_m, dqc_block_n, dqc_warps, dqc_stages = 64, 64, 8, 3
+        # dqc tiles come from _resolve_bwd_tiles above; honor the sweep override.
         if os.environ.get("NVFP4_BWD_TILE_OVERRIDE"):
             _e = os.environ
             dqc_block_m = int(_e.get("NVFP4_DQC_BM", dqc_block_m))
