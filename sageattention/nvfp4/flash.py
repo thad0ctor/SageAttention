@@ -3494,7 +3494,15 @@ def _run_bwd_hp(
             dq_block_m, dq_block_n, dq_warps, dq_stages = 64, 64, 8, 2
     else:
         dkdv_block_m, dkdv_block_n, dkdv_warps, dkdv_stages = 32, 32, 4, 3
-        dq_block_m, dq_block_n, dq_warps, dq_stages = 64, 32, 4, 2
+        # dQ recompute m-tile: packed-varlen wants the narrower 32-row tile
+        # (more programs -> better sm_120 occupancy, and short samples straddle
+        # fewer ragged kv boundaries); dense long-context wants 64 (5090 sweep:
+        # varlen 32 is 1.15-1.24x at 4-8k, dense 32 is 0.81x). Recompute only,
+        # the d256 dscache pass uses dqc_* below.
+        if varlen:
+            dq_block_m, dq_block_n, dq_warps, dq_stages = 32, 32, 4, 2
+        else:
+            dq_block_m, dq_block_n, dq_warps, dq_stages = 64, 32, 4, 2
     if os.environ.get("NVFP4_BWD_TILE_OVERRIDE"):  # sweep instrumentation
         _e = os.environ
         dkdv_block_m = int(_e.get("NVFP4_DKDV_BM", dkdv_block_m))
