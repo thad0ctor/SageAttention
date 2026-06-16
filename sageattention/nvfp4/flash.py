@@ -3050,6 +3050,10 @@ def _flash_decode_kernel(
     sk_sn,
     sv_kn,
     sv_sn,
+    sk_z,  # knv.stride(0) — batch base, may be capacity-sized (strided cache slice)
+    sks_z,  # ksc.stride(0)
+    sv_z,  # vnv.stride(0)
+    svs_z,  # vsc.stride(0)
     NSPLIT: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -3084,10 +3088,10 @@ def _flash_decode_kernel(
     l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
     acc = tl.zeros((BLOCK_M, D), dtype=tl.float32)
 
-    kbase = pid_zhk * (Skv * sk_kn)
-    kscbase = pid_zhk * (Skv * sk_sn)
-    vbase = pid_zhk * (D * sv_kn)
-    vscbase = pid_zhk * (D * sv_sn)
+    kbase = pid_zhk * sk_z
+    kscbase = pid_zhk * sks_z
+    vbase = pid_zhk * sv_z
+    vscbase = pid_zhk * svs_z
 
     offs_n0 = tl.arange(0, BLOCK_N)
     offs_np = tl.arange(0, NP2)
@@ -3272,6 +3276,8 @@ def _decode_compute(
         sq_qn=qnv_v.stride(1), sq_sn=qsc_v.stride(1),
         sk_kn=knv_v.stride(1), sk_sn=ksc_v.stride(1),
         sv_kn=vnv_v.stride(1), sv_sn=vsc_v.stride(1),
+        sk_z=knv_v.stride(0), sks_z=ksc_v.stride(0),
+        sv_z=vnv_v.stride(0), svs_z=vsc_v.stride(0),
         NSPLIT=nsplit, BLOCK_M=BLOCK_M, BLOCK_N=block_n,
         DP2=d // 2, DP16=d // 16, NP2=block_n // 2, NP16=block_n // 16,
         num_warps=num_warps, num_stages=num_stages,
