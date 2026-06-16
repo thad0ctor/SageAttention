@@ -22,8 +22,10 @@ from .flash import (
     nvfp4_flash_decode_prequant,
     nvfp4_quant_kv_decode,
 )
+from .kv_cache import NVFP4KVCache
 
 __all__ = [
+    "NVFP4KVCache",
     "nvfp4_flash_attention",
     "nvfp4_flash_attention_packed",
     "nvfp4_flash_attn_func",
