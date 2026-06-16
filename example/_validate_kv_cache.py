@@ -13,6 +13,7 @@ from sageattention.nvfp4 import (
 
 
 def cos(a, b):
+    """Cosine similarity between two tensors, flattened to fp32."""
     return F.cosine_similarity(a.reshape(1, -1).float(), b.reshape(1, -1).float()).item()
 
 
@@ -27,6 +28,7 @@ def build_via_cache(k_full, v_full, prefill_len):
 
 
 def main():
+    """Validate the cache build path vs whole-pack and bf16 SDPA across lengths."""
     torch.manual_seed(0)
     dev = "cuda"
     z, hk, h, d = 2, 2, 12, 128  # g=6 GQA, head_dim 128 (Qwen2.5-1.5B-like)

@@ -123,6 +123,7 @@ class NVFP4KVCache:
         block_n: int = 128,
         recent_window: int = 0,
     ):
+        """Allocate the FP4 cache buffers (see the class docstring for args)."""
         assert d in (128, 256), "D must be 128 or 256"
         self.z = z
         self.hk = hk

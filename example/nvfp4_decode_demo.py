@@ -42,6 +42,7 @@ RECENT_WINDOW = 128    # recent-window size for hybrid mode
 
 
 def make_fp4_forward(orig_forward):
+    """Build a Qwen2Attention.forward that routes decode through the FP4 KV cache."""
     apply_rope = qwen2_mod.apply_rotary_pos_emb
 
     def forward(self, hidden_states, position_embeddings, attention_mask=None,
@@ -79,6 +80,7 @@ def make_fp4_forward(orig_forward):
 
 
 def install_patch(model):
+    """Swap every Qwen2 attention layer's forward for the FP4-cache version."""
     layers = model.model.layers
     orig = qwen2_mod.Qwen2Attention.forward
     for layer in layers:
@@ -114,7 +116,7 @@ def prefill_and_seed(model, input_ids, max_seq_len):
             k = mod.k_proj(hs).view(hshape).transpose(1, 2)
             v = mod.v_proj(hs).view(hshape).transpose(1, 2)
             cos, sin = pe
-            q_dummy = k  # apply_rope needs a q; reuse k's shape is wrong, so build q
+            # apply_rope needs a real q; build it from the hidden states
             q = mod.q_proj(hs).view((*ishape, -1, mod.head_dim)).transpose(1, 2)
             _, k = apply_rope(q, k, cos, sin)
             captured[idx] = (k.detach(), v.detach())
@@ -143,6 +145,7 @@ def prefill_and_seed(model, input_ids, max_seq_len):
 # fp4-cache greedy decode (manual loop driving the patched model).
 # ---------------------------------------------------------------------------
 def generate_fp4(model, input_ids, n_new, position_ids_start):
+    """Greedily decode n_new tokens through the FP4 KV-cache path."""
     global _FP4_ENABLED
     out, _ = prefill_and_seed(model, input_ids, max_seq_len=input_ids.shape[1] + n_new + 4)
     next_logits = out.logits[:, -1, :]
@@ -197,6 +200,7 @@ def fp4_logits_stepwise(model, input_ids, n_new, ref_tokens, pos_start):
 
 
 def bf16_logits_stepwise(model, input_ids, n_new):
+    """Teacher-forced bf16 reference: per-step logits with the stock cache."""
     global _FP4_ENABLED
     _FP4_ENABLED = False
     with torch.no_grad():
@@ -210,6 +214,7 @@ def bf16_logits_stepwise(model, input_ids, n_new):
 
 
 def main():
+    """Run the FP4 vs bf16 decode demo: coherence, token agreement, mem, latency."""
     print("device cap:", torch.cuda.get_device_capability(0),
           "name:", torch.cuda.get_device_name(0))
     assert torch.cuda.get_device_capability(0) == (12, 0), "need sm_120"
@@ -241,6 +246,7 @@ def main():
     bf16_text = tok.decode(bf16_tokens[0], skip_special_tokens=True)
 
     def report(label, gen_tokens, scores):
+        """Print generated text + per-step top-token agreement vs the bf16 reference."""
         text = tok.decode(gen_tokens[0], skip_special_tokens=True)
         print("\n" + "=" * 70)
         print(f"{label} GENERATED TEXT:")
@@ -301,6 +307,7 @@ def main():
 
 
 def bench_latency(model, tok, cfg, ctx_len=3072, n_steps=40):
+    """Benchmark per-step decode latency: FP4 cache vs HF DynamicCache."""
     print("\n" + "=" * 70)
     print(f"DECODE LATENCY @ context {ctx_len} ({n_steps} timed steps):")
     print("=" * 70)
