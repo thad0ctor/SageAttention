@@ -299,7 +299,17 @@ class NVFP4KVCache:
         softmax (log-sum-exp) merge. Falls back to the all-fp4 path's accuracy on
         the old bulk while keeping recent attention exact.
         """
-        assert self.recent_window > 0, "hybrid_decode needs recent_window > 0"
+        # Raise (not assert) so these preconditions survive `python -O` (which
+        # strips asserts) — hybrid_decode is on the inference/serving path.
+        if self.recent_window <= 0:
+            raise RuntimeError(
+                "hybrid_decode needs recent_window > 0 "
+                "(construct NVFP4KVCache with recent_window>0)"
+            )
+        if self.length == 0:
+            raise RuntimeError(
+                "hybrid_decode requires at least one token (call prefill/append first)"
+            )
         z, h, _, d = query.shape
         W = self.recent_window
         s = self.length
