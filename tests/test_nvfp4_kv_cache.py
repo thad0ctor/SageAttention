@@ -382,6 +382,21 @@ def test_hybrid_decode_empty_cache_raises():
         cache.hybrid_decode(q, scaling, g)
 
 
+def test_hybrid_decode_requires_recent_window():
+    """hybrid_decode on a cache built with recent_window=0 raises (no bf16 ring)."""
+    z, hk, h, d = 2, 2, 12, 128
+    g = h // hk
+    scaling = 1.0 / math.sqrt(d)
+    # recent_window defaults to 0 -> no bf16 recent ring -> hybrid_decode invalid.
+    cache = NVFP4KVCache(z, hk, d, max_seq_len=128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(z, hk, 16, d, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(z, hk, 16, d, device="cuda", dtype=torch.bfloat16)
+    cache.prefill(k, v)  # non-empty, so this isolates the recent_window guard
+    q = torch.randn(z, h, 1, d, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError):
+        cache.hybrid_decode(q, scaling, g)
+
+
 # ---------------------------------------------------------------------------
 # 7. Memory accounting: fp4 footprint ~4x below bf16 at long context (V padding
 #    amortized once s >= 4*block_n), matching the example's ratio > 3.2 gate.
